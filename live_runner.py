@@ -153,8 +153,9 @@ ENTRY = {
     "sumegh": ROUND_START,
     "shyam": ROUND_START,
     "harsimran": ROUND_START,
-    # Latest revision received Jul 22; score only from the first session after receipt.
-    "sankeerth": "2026-07-23",
+    # Revision (commit 7fe6224) received Sep 21; score forward from the first
+    # session after it was loaded on Sep 26. The earlier result is dropped.
+    "sankeerth": "2026-09-28",
     "siddu": ROUND_START,
     "rohit": ROUND_START,
     "nagarjuna": ROUND_START,
@@ -181,7 +182,9 @@ ENTRY = {
     "sham": "2026-08-10",
     "rishchith": "2026-07-08",
     # Timely final revision received Aug 30; score it from the next US market session.
-    "meet": "2026-08-31",
+    # v7 revision (commit 377dd8e) received Sep 21; score forward from the
+    # first session after it was loaded on Sep 26. Earlier result dropped.
+    "meet": "2026-09-28",
     # Latest revision received before the Aug 26 US market open; score it forward only.
     "vishwas": "2026-08-26",
     "mahesh": "2026-08-17",
