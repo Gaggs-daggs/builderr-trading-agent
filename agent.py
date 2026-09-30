@@ -65,6 +65,8 @@ CASH_BUFFER = 0.98
 MAX_ORDERS = 45
 MIN_BARS = 51
 MIN_VOL_FLOOR = 0.08  # avoid dividing by ~0 vol on a freakishly quiet name
+CORR_LOOKBACK = 40   # trading days of daily returns used for the correlation check
+CORR_MAX = 0.80      # above this, two "different" picks are really the same bet
 
 # A genuine V-recovery shows a strong short-horizon thrust on QQQ; lets a
 # CASH -> DEFENSIVE re-entry fire without waiting for the slow SMA50 reclaim.
@@ -74,15 +76,19 @@ THRUST_MIN_RET = 0.12
 
 INDEX_REF = ("SPY", "QQQ")
 
-LEADER_STOCKS = (
+# The full round-frozen tradable universe (universe.json), minus the leveraged
+# names in BETA — those stay gated to the dedicated FULL-only SLEEVE below so
+# leverage never sneaks in through the general momentum ranker. Scanning the
+# whole ~1000-name universe (instead of a hand-picked ~36) means the agent can
+# catch a genuine leader wherever it shows up, and the breadth read (how much
+# of the market is actually healthy) is a real market-wide signal rather than
+# a guess from a small hand-picked sample.
+UNIVERSE_TICKERS: tuple[str, ...] = (
     "NVDA", "MSFT", "AAPL", "META", "AMZN", "GOOGL", "AVGO", "AMD", "MU", "MRVL",
     "NFLX", "TSLA", "PLTR", "ORCL", "CRM", "JPM", "V", "MA", "COST", "LLY",
-)
-LEADER_ETFS = (
     "QQQ", "SPY", "SMH", "XLK", "XLC", "XLY", "XLF", "XLI", "XLE", "XLV",
     "XLP", "XLU", "XLRE", "DIA", "IWM", "SOXX",
 )
-LEADER_POOL = tuple(dict.fromkeys(LEADER_STOCKS + LEADER_ETFS))
 
 # 2x ETF sleeve — bought ONLY in the FULL state.
 SLEEVE = ("QLD", "SSO")
@@ -186,6 +192,86 @@ def _momentum_score(closes: list[float]) -> Optional[float]:
     if r_long is None or r_short is None or gap is None:
         return None
     return MOM_W_LONG * r_long + MOM_W_SHORT * r_short + MOM_W_GAP * gap
+
+
+def _daily_returns(closes: list[float], n: int) -> Optional[list[float]]:
+    """Last n daily returns, oldest first, or None if there isn't enough history."""
+    if len(closes) < n + 1:
+        return None
+    window = closes[-(n + 1):]
+    rets: list[float] = []
+    for i in range(1, len(window)):
+        prev = window[i - 1]
+        if prev <= 0.0:
+            return None
+        rets.append(window[i] / prev - 1.0)
+    return rets
+
+
+def _pearson(a: list[float], b: list[float]) -> float:
+    """Correlation of two return series over their common trailing window."""
+    n = min(len(a), len(b))
+    if n < 5:
+        return 0.0
+    a = a[-n:]
+    b = b[-n:]
+    mean_a = sum(a) / n
+    mean_b = sum(b) / n
+    cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
+    var_a = sum((x - mean_a) ** 2 for x in a)
+    var_b = sum((x - mean_b) ** 2 for x in b)
+    denom = math.sqrt(var_a * var_b)
+    if denom <= 1e-12:
+        return 0.0
+    return cov / denom
+
+
+def _select_diversified(
+    qualifiers: list[tuple[float, str, float]],
+    market_state: dict,
+    cache: dict,
+) -> list[tuple[float, str, float]]:
+    """Greedily take the best-scoring qualifiers, skipping ones too correlated
+    with an already-picked name — so "5 leaders" isn't secretly "1 AI trade
+    wearing 5 tickers". If diversity runs out before TOP_N_MAX slots are
+    filled, the leftover slots are backfilled by score regardless of
+    correlation: being picky about diversification should never be a reason
+    to hold less than the strategy otherwise would.
+    """
+    returns_cache: dict[str, Optional[list[float]]] = {}
+
+    def rets_of(ticker: str) -> Optional[list[float]]:
+        if ticker not in returns_cache:
+            closes = _closes_of(market_state, ticker, cache)
+            returns_cache[ticker] = _daily_returns(closes, CORR_LOOKBACK) if closes else None
+        return returns_cache[ticker]
+
+    selected: list[tuple[float, str, float]] = []
+    skipped: list[tuple[float, str, float]] = []
+    for cand in qualifiers:
+        if len(selected) >= TOP_N_MAX:
+            break
+        cand_rets = rets_of(cand[1])
+        if cand_rets is None:
+            selected.append(cand)  # can't check correlation; don't punish it
+            continue
+        too_correlated = False
+        for sel in selected:
+            sel_rets = rets_of(sel[1])
+            if sel_rets is not None and _pearson(cand_rets, sel_rets) > CORR_MAX:
+                too_correlated = True
+                break
+        (skipped if too_correlated else selected).append(cand)
+
+    if len(selected) < TOP_N_MAX:
+        for cand in skipped:
+            if len(selected) >= TOP_N_MAX:
+                break
+            if cand not in selected:
+                selected.append(cand)
+
+    selected.sort(key=lambda triple: (-triple[0], triple[1]))
+    return selected[:TOP_N_MAX]
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +389,7 @@ def _build_targets(
 
     # --- selection: qualify + rank the leader pool by momentum ---
     qualifiers: list[tuple[float, str, float]] = []
-    for ticker in LEADER_POOL:
+    for ticker in UNIVERSE_TICKERS:
         if ticker in stop_block:
             continue
         closes = _closes_of(market_state, ticker, cache)
@@ -322,7 +408,7 @@ def _build_targets(
             qualifiers.append((score, ticker, max(vol, MIN_VOL_FLOOR)))
 
     qualifiers.sort(key=lambda triple: (-triple[0], triple[1]))
-    selected = qualifiers[:TOP_N_MAX]
+    selected = _select_diversified(qualifiers, market_state, cache)
 
     # --- risk-adjusted-momentum sizing: weight by score/vol so a strong,
     #     calm leader outweighs a strong-but-jumpy one, but raw momentum
@@ -533,7 +619,7 @@ def _run(market_state: dict, portfolio_state: dict, cash: float) -> list[dict[st
 
     n_comp = 0
     n_up = 0
-    for ticker in LEADER_POOL:
+    for ticker in UNIVERSE_TICKERS:
         closes = _closes_of(market_state, ticker, cache)
         if not _computable(closes):
             continue
