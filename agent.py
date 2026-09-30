@@ -677,6 +677,18 @@ def _run(market_state: dict, portfolio_state: dict, cash: float) -> list[dict[st
         )
         _state = "FULL" if full_conditions else "NEUTRAL"
 
+    # Re-entering from CASH: refresh the high-water mark to right now, so the
+    # drawdown taper measures risk from the point of re-entry forward, not
+    # against a peak set BEFORE the agent had already de-risked. Otherwise a
+    # strong pre-cash-out rally makes the very next re-entry look artificially
+    # risky and gets throttled by a taper that has nothing to do with the
+    # agent's actual current exposure -- it punishes having already protected
+    # the account, exactly backwards from the taper's purpose.
+    if prev_cycle_state == "CASH" and _state != "CASH":
+        _peak_equity = equity
+        dd = 0.0
+        taper_mult = 1.0
+
     # ---- Trailing-stop updates (every cycle). ----
     for ticker in list(_pos_high):
         if ticker not in positions:
