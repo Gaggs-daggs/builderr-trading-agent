@@ -6,13 +6,13 @@ QQQ/SPY exposure. What held up was simpler: own the market, size exposure by
 how broadly the trend is intact, and use the allowed leverage only when the
 trend is broad and volatility is calm.
 
-Regime = fraction of trend lookbacks (SMA50..SMA250) that QQQ and SPY both
+Regime = fraction of trend lookbacks (SMA50/100/150/200) that QQQ and SPY both
 trade above, plus a QQQ volatility gate for the levered tier:
 
   ON    score >= 0.8 and QQQ vol20 < 28%  -> levered Nasdaq book (~1.35x beta)
   MID   score >= 0.4                      -> unlevered QQQ/SPY/tech book
   HALF  score >= 0.2                      -> half equity, half defensive
-  OFF   otherwise                         -> staples/healthcare/utilities/gold
+  OFF   otherwise                         -> staples/healthcare/utilities
 
 Averaging several lookbacks instead of a single SMA200 switch keeps the
 regime call from hinging on one arbitrary number, and averaging the score over
@@ -21,7 +21,10 @@ brake (QQQ 10-day vol > 45% or 5-day return < -7%) is not smoothed and caps
 the tier at HALF, since the slow averages lag a sharp break.
 
 No network, no LLM, standard library only, stateless (no module globals), so
-it behaves the same whether the engine reuses the process or not. Every
+it behaves the same whether the engine reuses the process or not. The longest
+lookback (200) plus smoothing needs 202 bars, so the tier is identical whether
+the engine passes ~220 bars (admission) or ~309 (live board); a missing vote
+counts as bearish. Every ticker it can hold is in the live board's feed. Every
 target stays under CAP; beta-adjusted gross is clamped under MAX_BETA_GROSS;
 a rebalance is forced whenever live weights drift near either contest limit.
 """
@@ -31,7 +34,7 @@ import math
 from statistics import pstdev
 from typing import Any, Optional
 
-TREND_LOOKBACKS = (50, 100, 150, 200, 250)
+TREND_LOOKBACKS = (50, 100, 150, 200)
 ON_SCORE = 0.8
 MID_SCORE = 0.4
 HALF_SCORE = 0.2
@@ -43,7 +46,7 @@ CRASH_RET5 = -0.07         # QQQ 5-day return below this -> crash brake
 CRASH_REGIME = "HALF"      # the most exposure allowed while the brake is on
 
 CAP = 0.27                 # target weight per ticker (contest limit: < 30%)
-FORCE_TRIM_WEIGHT = 0.29   # live weight that forces a rebalance
+FORCE_TRIM_WEIGHT = 0.275  # live weight that forces a trim (keeps every close <= 28%)
 MAX_BETA_GROSS = 1.35      # target beta-adjusted gross (contest limit: 1.5x)
 FORCE_TRIM_GROSS = 1.42    # live gross that forces a rebalance
 DRIFT = 0.05               # rebalance when any weight is off target by this much
@@ -53,8 +56,8 @@ MAX_ORDERS = 45            # per call; contest limit is 50 trades/day (sells com
 
 BOOK_ON = {"TQQQ": 0.15, "QLD": 0.25, "QQQ": 0.27, "SMH": 0.20}
 BOOK_MID = {"QQQ": 0.27, "SPY": 0.27, "XLK": 0.20, "SMH": 0.15}
-BOOK_HALF = {"QQQ": 0.20, "SPY": 0.20, "XLP": 0.15, "XLV": 0.10, "GLD": 0.10}
-BOOK_OFF = {"XLP": 0.20, "XLU": 0.15, "XLV": 0.15, "GLD": 0.20}
+BOOK_HALF = {"QQQ": 0.20, "SPY": 0.20, "XLP": 0.15, "XLV": 0.10}
+BOOK_OFF = {"XLP": 0.20, "XLU": 0.15, "XLV": 0.15}
 
 BETA: dict[str, float] = {
     "QLD": 2.0, "SSO": 2.0, "DDM": 2.0, "ROM": 2.0, "UWM": 2.0, "AGQ": 2.0,
@@ -92,8 +95,10 @@ def _vol(closes: Optional[list[float]], n: int) -> Optional[float]:
 
 def trend_score(market_state: Any, days_back: int = 0) -> float:
     """Fraction of (lookback, index) pairs where the index closes above its SMA,
-    measured `days_back` sessions ago (recomputed from bars, so no state is kept)."""
-    votes: list[bool] = []
+    measured `days_back` sessions ago (recomputed from bars, so no state is kept).
+    The denominator is fixed: a vote that can't be computed (short history or
+    missing data) counts as bearish instead of silently dropping out."""
+    up = 0
     for ticker in ("QQQ", "SPY"):
         closes = _closes(market_state, ticker)
         if not closes or len(closes) <= days_back:
@@ -102,9 +107,9 @@ def trend_score(market_state: Any, days_back: int = 0) -> float:
             closes = closes[:-days_back]
         for n in TREND_LOOKBACKS:
             sma = _sma(closes, n)
-            if sma is not None:
-                votes.append(closes[-1] > sma)
-    return sum(votes) / len(votes) if votes else 0.0
+            if sma is not None and closes[-1] > sma:
+                up += 1
+    return up / (2 * len(TREND_LOOKBACKS))
 
 
 def smoothed_score(market_state: Any) -> float:
@@ -195,7 +200,8 @@ def _run(market_state: Any, portfolio_state: dict, cash: float) -> list[dict]:
     targets = target_weights(market_state)
     current = {t: q * (price(t) or 0.0) / equity for t, q in held.items()}
     live_gross = sum(w * _beta(t) for t, w in current.items())
-    near_limit = live_gross > FORCE_TRIM_GROSS or any(w > FORCE_TRIM_WEIGHT for w in current.values())
+    gross_breach = live_gross > FORCE_TRIM_GROSS
+    near_limit = gross_breach or any(w > FORCE_TRIM_WEIGHT for w in current.values())
     off_target = any(abs(targets.get(t, 0.0) - current.get(t, 0.0)) >= DRIFT for t in set(targets) | set(current))
     stray = any(t not in targets for t in current)
     if not (near_limit or off_target or stray):
@@ -214,7 +220,7 @@ def _run(market_state: Any, portfolio_state: dict, cash: float) -> list[dict]:
             proceeds += held[ticker] * px
             continue
         excess = held[ticker] - math.floor(goal * equity / px)
-        forced = current.get(ticker, 0.0) > FORCE_TRIM_WEIGHT or near_limit
+        forced = current.get(ticker, 0.0) > FORCE_TRIM_WEIGHT or gross_breach
         if excess > 0 and (excess * px >= min_trade or forced):
             orders.append({"ticker": ticker, "side": "sell", "quantity": float(excess)})
             proceeds += excess * px

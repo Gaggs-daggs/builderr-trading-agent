@@ -53,3 +53,54 @@
 
 ## 2cd930b — Trendline
 - Replaced Ridgeline with a trend-tiered ETF beta core. See the README.
+
+## forensics-v1 — post-mortem: bug fixes only, no performance changes kept
+
+**Bug fixes** (kept on correctness grounds, whatever the backtest says)
+- B1 `agent.py`: the trend lookbacks are now SMA50/100/150/200, and the vote
+  denominator is fixed so a missing vote counts as bearish. Before, the SMA250
+  vote only existed when the engine passed 252 or more bars. The live board
+  passes ~309 and admission ~220, so the two ran different strategies: the tier
+  differed on 5.6% of days, and the live variant had never been backtested.
+- B2 `agent.py`: GLD is removed from the HALF and OFF books. The live board feeds
+  only 42 tickers (`live_runner.ROUND2_FETCH_UNIVERSE`) and GLD isn't one of them,
+  so those slices were silently held as cash. Live behaviour is unchanged.
+- B3 `agent.py`: the forced trim fires above 27.5% (it was 29%), and a
+  single-name trim no longer forces 1-share trims of every other name. QQQ had
+  closed at 28.2–28.3% for 5 sessions in Sep 2024, over the 28% target.
+- Effect of B1–B3 (2011–2026, engine-faithful): CAGR 18.2% vs 17.4%, max
+  drawdown 28.3% vs 29.0%, peak position 27.7% vs 28.3%, better in every named
+  stress window. Before 2023 it's a wash (-0.05 points per 19-session window);
+  from 2023 the mean is +0.24.
+
+**Simulator fidelity** (`backtest.py`, `fetch_history.py`), matched to `live_runner.py`
+- dividend-adjusted OHLC, as yfinance `auto_adjust=True` gives;
+- a 309-bar history window;
+- only the 42 fed tickers visible and fillable;
+- sells before buys, at most 100 orders per decision;
+- each buy capped by cash, 30% room and 1.5x beta room at the open;
+- data from 2010, partial intraday bars dropped.
+- The 309-bar window alone moved Trendline's 2017–2026 CAGR from 23.3% to 20.7%.
+  Results from the old 220-bar simulator (including the 3-day smoothing
+  validation) didn't describe the live configuration.
+
+**Performance fixes tried** (selected on data through 2022; 54 candidate runs, 6 fixes)
+- A1, hysteresis band 0.125 with the tier read from holdings: passed selection
+  (+0.05 points per window, bootstrap 82%, helped in 19 of 21 ±20% settings).
+  Rejected at the one-time 2023+ confirmation: the 2025 crash-and-snapback window
+  was 2.05 points worse, bootstrap 73%, and it is 1.3 points worse in the 2020
+  crash trough. The gain is far below noise for that tail cost.
+- A2, fast exit with a 5-day entry confirmation: median -0.40. Rejected.
+- C, drawdown cap (QQQ 6% below its 20-day high caps the tier at MID): about 0.
+  Rejected.
+- M, no new ON entry when QQQ is more than 8% above its SMA50: about 0. Rejected.
+- P1, TQQQ ratchet (a 30% run-up then a 15% pullback caps the tier at MID):
+  +0.01 points per window. Immaterial, rejected.
+- P2, profit trim at 1.38x gross: about 0, bootstrap 12%. Rejected.
+
+**Tests**: `strategy_selftest.py` (22 checks) tightened to ≤1.45x and ≤28%, and adds:
+- a ±15% TQQQ shock day;
+- the Ridgeline-to-Trendline revision transition under the engine's fill rules;
+- history-length invariance (220 vs 309 bars);
+- every target ticker is in the live feed;
+- a trim before 28%.

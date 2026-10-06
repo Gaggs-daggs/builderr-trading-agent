@@ -30,15 +30,15 @@ Fork this repo, implement `decide()` in `agent.py`, then send us the repo — **
 
 `agent.py` is a no-network, no-LLM, stateless ETF strategy built for the live forward-return ranking (Round 2: July 7 – October 31, 2026):
 
-- **Trend score:** the fraction of SMA50/100/150/200/250 that QQQ and SPY both close above.
-- **Tiers:** ON (score ≥ 0.8 and QQQ 20-day vol < 28%) holds TQQQ/QLD/QQQ/SMH at ~1.35x beta. MID holds unlevered QQQ/SPY/XLK/SMH. HALF splits equity and defensives. OFF holds XLP/XLU/XLV/GLD.
+- **Trend score:** the fraction of SMA50/100/150/200 that QQQ and SPY both close above, averaged over the last 3 sessions. It needs 202 bars, so the tier is the same whether the engine passes ~220 bars (admission) or ~309 (live board).
+- **Tiers:** ON (score ≥ 0.8 and QQQ 20-day vol < 28%) holds TQQQ/QLD/QQQ/SMH at ~1.35x beta. MID holds unlevered QQQ/SPY/XLK/SMH. HALF splits equity and defensives. OFF holds XLP/XLU/XLV. Every ticker is in the live board's 42-ticker feed.
 - **Crash brake:** QQQ 10-day vol > 45% or 5-day return < −7% caps exposure at HALF.
-- **Caps:** per-ticker targets ≤ 27% with a forced trim above 29%; beta-adjusted gross targets 1.35x with a forced trim above 1.42x.
+- **Caps:** per-ticker targets ≤ 27% with a forced trim above 27.5% (keeps every close ≤ 28%); beta-adjusted gross targets 1.35x with a forced trim above 1.42x.
 
-Why this and not stock/sector momentum: on a 10-year walk-forward test (`backtest.py`, 112 rolling 60-day windows, 2017–2026), momentum rotation over a ticker list with no hindsight (the largest US stocks at end-2016, or sector ETFs) made ~4–8% a year, trailing QQQ buy-and-hold (~20%). Trendline made ~20.6% CAGR with a 30% max drawdown, versus QQQ's 35%. Past results on one decade of data are not a forecast.
+Why this and not stock/sector momentum: on a 10-year walk-forward test (`backtest.py`, 112 rolling 60-day windows, 2017–2026), momentum rotation over a ticker list with no hindsight (the largest US stocks at end-2016, or sector ETFs) made ~4–8% a year, trailing QQQ buy-and-hold (~20%). Re-run with the live engine's rules (dividend-adjusted bars, 309-bar history, 42-ticker feed, 2011–2026), Trendline made ~18% CAGR with a 28% max drawdown, versus QQQ's ~19% and 35%: roughly market-like return with a smaller drawdown, not an edge. Past results are not a forecast.
 
 - `python strategy_selftest.py` — strategy-specific cap/regime checks.
-- `python fetch_history.py && python backtest.py` — the 10-year walk-forward test (downloads public daily bars; not needed for submission).
+- `python fetch_history.py && python backtest.py` — walk-forward test that mirrors `live_runner.py`'s fill rules (downloads public daily bars; not needed for submission).
 
 ---
 

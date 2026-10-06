@@ -16,10 +16,10 @@ import agent
 
 
 UNIVERSE = (
-    "SPY", "QQQ", "XLK", "SMH", "XLP", "XLU", "XLV", "GLD",
+    "SPY", "QQQ", "XLK", "SMH", "XLP", "XLU", "XLV",
     "QLD", "SSO", "TQQQ",
 )
-DEFENSIVE = {"XLP", "XLU", "XLV", "GLD"}
+DEFENSIVE = {"XLP", "XLU", "XLV"}
 LEVERED = {"QLD", "SSO", "TQQQ"}
 
 
@@ -125,8 +125,9 @@ def test_on_target_book_does_not_churn() -> None:
 
 
 def test_limits_have_margin() -> None:
-    assert agent.CAP <= 0.28 and agent.FORCE_TRIM_WEIGHT < 0.30
+    assert agent.CAP <= 0.28 and agent.FORCE_TRIM_WEIGHT < 0.28
     assert agent.MAX_BETA_GROSS <= 1.45 and agent.FORCE_TRIM_GROSS <= 1.45
+    assert agent.MAX_ORDERS == 45
 
 
 def test_overlevered_book_is_trimmed_under_cap() -> None:
@@ -256,8 +257,8 @@ def test_rally_drift_stays_inside_limits() -> None:
         "rally then +5% day": [melt(0.012)] * 8 + [melt(0.05)] + [{}] * 3,
     }.items():
         gross, weight, longest = simulate_book(path)
-        assert gross <= 1.5, (name, gross)
-        assert weight < 0.30 and longest <= 1, (name, weight, longest)
+        assert gross <= 1.45, (name, gross)
+        assert weight <= 0.28 and longest == 0, (name, weight, longest)
 
 
 def test_gap_down_stays_inside_limits() -> None:
@@ -267,8 +268,96 @@ def test_gap_down_stays_inside_limits() -> None:
         "-10% then +5% bounce": [melt(-0.10), melt(0.05)] + [{}] * 3,
     }.items():
         gross, weight, longest = simulate_book(path)
-        assert gross <= 1.5, (name, gross)
-        assert weight < 0.30 and longest <= 1, (name, weight, longest)
+        assert gross <= 1.45, (name, gross)
+        assert weight <= 0.28 and longest == 0, (name, weight, longest)
+
+
+def test_tqqq_single_day_shocks_stay_inside_limits() -> None:
+    """A single +/-15% TQQQ day (QQQ +/-5%), alone and after a rally."""
+    for name, path in {
+        "TQQQ +15% day": [melt(0.05)] + [{}] * 4,
+        "TQQQ -15% day": [melt(-0.05)] + [{}] * 4,
+        "rally then TQQQ +15%": [melt(0.012)] * 6 + [melt(0.05)] + [{}] * 3,
+        "rally then TQQQ -15%": [melt(0.012)] * 6 + [melt(-0.05)] + [{}] * 3,
+    }.items():
+        gross, weight, longest = simulate_book(path)
+        assert gross <= 1.45, (name, gross)
+        assert weight <= 0.28 and longest == 0, (name, weight, longest)
+
+
+def engine_fill(cash: float, held: dict[str, float], orders: list[dict], px: dict[str, float]):
+    """live_runner.run_bot's opening-fill rules: sells first; each buy capped by cash,
+    30% single-name room and 1.5x beta-gross room (slippage ignored)."""
+    held = dict(held)
+    for o in sorted(orders[:100], key=lambda o: 0 if o["side"] == "sell" else 1):
+        t, q, p = o["ticker"], float(o["quantity"]), px[o["ticker"]]
+        if o["side"] == "sell":
+            q = min(q, held.get(t, 0.0))
+            held[t] = held.get(t, 0.0) - q
+            cash += q * p
+            continue
+        equity = cash + sum(v * px[k] for k, v in held.items())
+        name_room = 0.30 * equity - held.get(t, 0.0) * p
+        beta_room = 1.5 * equity - sum(v * px[k] * agent._beta(k) for k, v in held.items())
+        q = max(0.0, min(q, min(cash, name_room, beta_room / agent._beta(t)) / p))
+        held[t] = held.get(t, 0.0) + q
+        cash -= q * p
+    return cash, {t: v for t, v in held.items() if v > 1e-9}
+
+
+def test_revision_transition_from_ridgeline_book() -> None:
+    """If a revision inherits the old Ridgeline book (stocks + QLD/SSO sleeve at 1.45x),
+    the first decision migrates it in one session without breaching any limit."""
+    data = market(CALM_UP)
+    for t in ("NVDA", "AMD", "MU"):
+        data[t] = bars(100.0, [0.002] * len(CALM_UP))
+    px = {t: v[-1]["close"] for t, v in data.items()}
+    book = {"NVDA": 0.25, "AMD": 0.20, "MU": 0.10, "QLD": 0.23, "SSO": 0.22}
+    held = {t: w * 100_000.0 / px[t] for t, w in book.items()}
+    pf = {"cash": 0.0, "last_prices": px,
+          "positions": [{"ticker": t, "quantity": q, "avg_cost": px[t]} for t, q in held.items()]}
+    orders = agent.decide(data, pf, 0.0)
+    assert 0 < len(orders) <= 45, len(orders)
+    cash, after = engine_fill(0.0, held, orders, px)
+    equity = cash + sum(q * px[t] for t, q in after.items())
+    gross = sum(q * px[t] * agent._beta(t) for t, q in after.items()) / equity
+    assert gross <= 1.45, gross
+    assert all(q * px[t] / equity <= 0.28 for t, q in after.items()), after
+    assert not set(after) & {"NVDA", "AMD", "MU", "SSO"}, after
+
+
+def test_tier_is_independent_of_history_length() -> None:
+    """Admission passes ~220 bars, the live board ~309: the tier must not depend on which."""
+    path = [0.0015] * 300 + [-0.004] * 60 + [0.003] * 60
+    for end in range(330, len(path) + 1, 6):
+        full = market(path[:end])
+        short = {t: v[-220:] for t, v in full.items()}
+        assert agent.regime(full) == agent.regime(short), end
+    thin = {t: v[-60:] for t, v in market(CALM_UP).items()}
+    assert agent.trend_score(thin) <= 0.25 and agent.regime(thin) != "ON", "thin history must not look like a full trend"
+
+
+def test_every_target_is_in_the_live_feed() -> None:
+    from fetch_history import LIVE_FEED
+    for book in (agent.BOOK_ON, agent.BOOK_MID, agent.BOOK_HALF, agent.BOOK_OFF):
+        assert set(book) <= set(LIVE_FEED), set(book) - set(LIVE_FEED)
+
+
+def test_drifted_position_is_trimmed_before_28pct() -> None:
+    """A MID book whose QQQ drifted to 27.8% trims QQQ only (no tiny trims elsewhere)."""
+    data = market([0.0015] * 200 + [0.0005] * 60, other=0.0005)
+    px = {t: v[-1]["close"] for t, v in data.items()}
+    weights = dict(agent.target_weights(data))
+    assert "QQQ" in weights, weights
+    weights["QQQ"] = 0.278
+    held = {t: w * 100_000.0 / px[t] for t, w in weights.items()}
+    cash = 100_000.0 - sum(q * px[t] for t, q in held.items())
+    pf = {"cash": cash, "last_prices": px,
+          "positions": [{"ticker": t, "quantity": q, "avg_cost": px[t]} for t, q in held.items()]}
+    orders = agent.decide(data, pf, cash)
+    sells = {o["ticker"]: o["quantity"] for o in orders if o["side"] == "sell"}
+    assert set(sells) == {"QQQ"}, orders
+    assert (held["QQQ"] - sells["QQQ"]) * px["QQQ"] / 100_000.0 <= agent.CAP + 1e-9
 
 
 def test_orders_are_bounded_and_fast() -> None:
@@ -292,6 +381,11 @@ def run() -> None:
         test_overweight_position_is_trimmed,
         test_on_target_book_does_not_churn,
         test_limits_have_margin,
+        test_tqqq_single_day_shocks_stay_inside_limits,
+        test_revision_transition_from_ridgeline_book,
+        test_tier_is_independent_of_history_length,
+        test_every_target_is_in_the_live_feed,
+        test_drifted_position_is_trimmed_before_28pct,
         test_rally_drift_stays_inside_limits,
         test_gap_down_stays_inside_limits,
         test_overlevered_book_is_trimmed_under_cap,

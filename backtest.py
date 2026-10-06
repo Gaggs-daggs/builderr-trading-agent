@@ -1,17 +1,24 @@
-"""Walk-forward backtester over ~10 years of real daily bars.
+"""Walk-forward backtester that mirrors the live leaderboard engine (live_runner.py).
 
     python fetch_history.py               # once: pulls bars into data_cache/bars.json
     python backtest.py                    # evaluates agent.py
     python backtest.py my_variant.py      # evaluates another file
 
-Fill model mirrors preview.py: orders from day t fill at day t+1's open with
-5 bps slippage (10 bps on leveraged ETFs), buys are capped by cash, marks are
-on the close. Each window gets a freshly loaded agent (fresh globals), like
-the real engine.
+Engine rules reproduced here (see live_runner.run_bot):
+  * decide() sees only bars up to the prior close; orders fill at the next
+    session's OPEN with 5 bps slippage (10 bps on 2x/3x ETFs).
+  * At most 100 orders per decision are read; sells execute before buys.
+  * Each buy is capped by cash, by 30% single-name room and by 1.5x beta-gross
+    room, all measured at the opening fill (equity at the open).
+  * Only the 42 tickers the live board fetches (fetch_history.LIVE_FEED) are
+    visible and fillable; anything else is silently dropped, as live.
+  * market_state carries up to 309 bars per ticker, as the live board's
+    310-bar fetch does (admission's hidden regimes use ~220; pass history=220).
+  * Prices are split- and dividend-adjusted, like yfinance auto_adjust=True.
 
-Windows: 60 trading days, a new one every 20 days, each with ~220 bars of
-history. Split into TRAIN (window start before 2022-07-01) and TEST (after),
-so a change only counts if it helps on years it was not tuned on.
+Windows: 60 trading days, a new one every 20 days. Split into TRAIN (window
+start before 2023-01-01) and TEST (after), so a change only counts if it helps
+on years it was not tuned on.
 """
 from __future__ import annotations
 
@@ -22,15 +29,21 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+from fetch_history import LIVE_FEED
+
 HERE = Path(__file__).parent
 DATA = HERE / "data_cache" / "bars.json"
 BETA_3X = {"TQQQ", "SOXL", "UPRO", "SPXL", "TNA", "FAS", "TECL", "LABU", "CURE", "DRN", "UDOW", "NAIL"}
 BETA_2X = {"QLD", "SSO", "DDM", "ROM", "UWM", "AGQ"}
 START_CASH = 100_000.0
-HISTORY = 220
+HISTORY = 309                 # bars visible to decide() on the live board
+ADMISSION_HISTORY = 220       # README: admission regimes carry ~220 bars
+MAX_ORDERS_PER_DECISION = 100
+MAX_NAME_WEIGHT = 0.30
+MAX_BETA_GROSS = 1.50
 WINDOW = 60
 STEP = 20
-SPLIT = "2022-07-01"
+SPLIT = "2023-01-01"
 ROUND2_START = "2026-07-07"
 
 
@@ -39,7 +52,9 @@ def beta(t: str) -> float:
 
 
 class Market:
-    def __init__(self, raw: dict[str, list[list]]):
+    """Daily bars indexed by date. `feed` limits what the agent can see and trade."""
+
+    def __init__(self, raw: dict[str, list[list]], feed=LIVE_FEED):
         self.cal = [r[0] for r in raw["SPY"]]
         self.bars: dict[str, list[dict]] = {}
         self.idx: dict[str, dict[str, int]] = {}
@@ -49,6 +64,7 @@ class Market:
                 for r in rows
             ]
             self.idx[t] = {r[0]: i for i, r in enumerate(rows)}
+        self.feed = [t for t in (feed if feed is not None else raw) if t in raw]
 
     def px(self, t: str, date: str, field: str):
         i = self.idx.get(t, {}).get(date)
@@ -56,15 +72,16 @@ class Market:
 
 
 class LazyState(Mapping):
-    """market_state view: each ticker's last HISTORY bars up to `date`, sliced on demand."""
+    """market_state view: each feed ticker's last `history` bars up to `date`, sliced on demand."""
 
-    def __init__(self, mkt: Market, date: str):
-        self.m, self.d, self.cache = mkt, date, {}
+    def __init__(self, mkt: Market, date: str, history: int = HISTORY):
+        self.m, self.d, self.h, self.cache = mkt, date, history, {}
+        self.allowed = set(mkt.feed)
 
     def _slice(self, t):
         if t not in self.cache:
-            i = self.m.idx.get(t, {}).get(self.d)
-            self.cache[t] = None if i is None else self.m.bars[t][max(0, i - HISTORY + 1): i + 1]
+            i = self.m.idx.get(t, {}).get(self.d) if t in self.allowed else None
+            self.cache[t] = None if i is None else self.m.bars[t][max(0, i - self.h + 1): i + 1]
         return self.cache[t]
 
     def __getitem__(self, t):
@@ -74,7 +91,7 @@ class LazyState(Mapping):
         return v
 
     def __iter__(self):
-        return (t for t in self.m.bars if self._slice(t) is not None)
+        return (t for t in self.m.feed if self._slice(t) is not None)
 
     def __len__(self):
         return sum(1 for _ in self)
@@ -87,59 +104,96 @@ def load(path: Path):
     return mod.decide
 
 
-def simulate(agent_path: Path, mkt: Market, dates: list[str], cost_mult: float = 1.0, probe=None) -> dict:
-    """Run one fresh agent over `dates`. Orders decided on day t's close fill at day t+1's open.
+def simulate(agent_path: Path, mkt: Market, dates: list[str], cost_mult: float = 1.0, probe=None,
+             history: int = HISTORY, start_book: dict | None = None, record: bool = False) -> dict:
+    """Run one fresh agent over `dates` with the live engine's fill rules.
 
-    cost_mult scales slippage (1.0 = 5 bps plain / 10 bps leveraged). `probe(state)`, if given,
-    is called on each day's market view and its result recorded (e.g. the agent's regime).
+    Orders decided on day t's close fill at day t+1's open. cost_mult scales slippage.
+    `probe(state)` is recorded each day (e.g. the agent's regime). `start_book`
+    ({"cash": x, "positions": {ticker: qty}}) starts from an inherited book instead of
+    cash. `record=True` also returns every fill and the end-of-day holdings.
     """
     decide = load(agent_path)
-    cash, pos, pending = START_CASH, {}, []
-    curve, gross_path, probes = [], [], []
-    trades, traded, costs, errors = 0, 0.0, 0.0, 0
-    peak_gross, peak_conc, streak, max_streak = 0.0, 0.0, {}, 0
-    for date in dates:
-        for o in pending:
-            px = mkt.px(o["ticker"], date, "open")
-            if px is None:
+    cash = float(start_book["cash"]) if start_book else START_CASH
+    pos = {t: float(q) for t, q in (start_book or {}).get("positions", {}).items() if q > 0}
+    avg_cost: dict[str, float] = {}
+    start_equity = cash + sum(q * (mkt.px(t, dates[0], "open") or 0.0) for t, q in pos.items())
+    pending: list[dict] = []
+    curve, gross_path, gross_open_path, probes, fills, books = [], [], [], [], [], []
+    trades, traded, costs, errors, capped = 0, 0.0, 0.0, 0, 0
+    peak_gross, peak_gross_open, peak_conc, streak, max_streak = 0.0, 0.0, 0.0, {}, 0
+    feed = set(mkt.feed)
+    for di, date in enumerate(dates):
+        open_px = {t: p for t in feed if (p := mkt.px(t, date, "open")) is not None}
+        prev_close = {t: mkt.px(t, dates[di - 1], "close") for t in feed} if di else {}
+        normalized = []
+        for o in pending[:MAX_ORDERS_PER_DECISION]:
+            try:
+                tk, side, qty = str(o["ticker"]).strip().upper(), o["side"], float(o["quantity"])
+            except (KeyError, TypeError, ValueError):
                 continue
-            slip = (0.001 if beta(o["ticker"]) > 1 else 0.0005) * cost_mult
-            if o["side"] == "buy":
+            if side in ("buy", "sell") and math.isfinite(qty) and qty > 0 and tk in open_px:
+                normalized.append((tk, side, qty))
+        for tk, side, qty in sorted(normalized, key=lambda x: 0 if x[1] == "sell" else 1):
+            px = open_px[tk]
+            slip = (0.001 if beta(tk) > 1 else 0.0005) * cost_mult
+            want = qty
+            if side == "buy":
                 fill = px * (1 + slip)
-                qty = min(o["quantity"], cash / fill)
-                if qty > 0:
-                    pos[o["ticker"]] = pos.get(o["ticker"], 0.0) + qty
-                    cash -= qty * fill
+                eq_open = max(cash + sum(q * open_px.get(t, 0.0) for t, q in pos.items()), 1e-9)
+                held = pos.get(tk, 0.0)
+                conc_room = max(0.0, MAX_NAME_WEIGHT * eq_open - held * fill)
+                beta_used = sum(q * open_px.get(t, 0.0) * beta(t) for t, q in pos.items())
+                beta_room = max(0.0, MAX_BETA_GROSS * eq_open - beta_used)
+                qty = min(qty, min(cash, conc_room, beta_room / beta(tk)) / fill if fill > 0 else 0.0)
+                if qty < want - 1e-9 and min(conc_room, beta_room / beta(tk)) < cash:
+                    capped += 1
+                if qty <= 0:
+                    continue
+                avg_cost[tk] = (avg_cost.get(tk, 0.0) * held + fill * qty) / (held + qty)
+                pos[tk] = held + qty
+                cash -= fill * qty
             else:
-                qty = min(o["quantity"], pos.get(o["ticker"], 0.0))
-                if qty > 0:
-                    pos[o["ticker"]] -= qty
-                    cash += qty * px * (1 - slip)
-            if qty > 0:
-                trades += 1
-                traded += qty * px
-                costs += qty * px * slip
+                qty = min(qty, pos.get(tk, 0.0))
+                if qty <= 0:
+                    continue
+                pos[tk] -= qty
+                cash += qty * px * (1 - slip)
+            trades += 1
+            traded += qty * px
+            costs += qty * px * slip
+            if record:
+                fills.append({"date": date, "ticker": tk, "side": side, "qty": qty, "open": px,
+                              "prev_close": prev_close.get(tk), "slip": qty * px * slip})
         pending = []
-        prices = {t: mkt.px(t, date, "close") for t in pos if pos[t] > 0}
-        prices = {t: p for t, p in prices.items() if p is not None}
-        value = {t: pos[t] * prices.get(t, 0.0) for t in pos}
+        if normalized:
+            eq_o = max(cash + sum(q * open_px.get(t, 0.0) for t, q in pos.items()), 1e-9)
+            g_o = sum(q * open_px.get(t, 0.0) * beta(t) for t, q in pos.items()) / eq_o
+            peak_gross_open = max(peak_gross_open, g_o)
+            gross_open_path.append(g_o)
+        prices = {t: p for t in pos if pos[t] > 0 and (p := mkt.px(t, date, "close")) is not None}
+        value = {t: pos[t] * prices.get(t, 0.0) for t in pos if pos[t] > 0}
         equity = max(cash + sum(value.values()), 1e-9)
         curve.append(equity)
         gross = sum(v * beta(t) for t, v in value.items()) / equity
         gross_path.append(gross)
         peak_gross = max(peak_gross, gross)
-        for t, v in value.items():
-            w = v / equity
+        for t in set(streak) | set(value):
+            w = value.get(t, 0.0) / equity
             peak_conc = max(peak_conc, w)
-            streak[t] = streak.get(t, 0) + 1 if w >= 0.30 else 0
+            streak[t] = streak.get(t, 0) + 1 if w >= MAX_NAME_WEIGHT else 0
             max_streak = max(max_streak, streak[t])
-        state = LazyState(mkt, date)
+        if record:
+            books.append({"date": date, "cash": cash, "positions": {t: q for t, q in pos.items() if q > 0},
+                          "equity": equity})
+        state = LazyState(mkt, date, history)
         if probe is not None:
             probes.append(probe(state))
-        last = {t: state[t][-1]["close"] for t in state if t in pos or t in ("SPY", "QQQ")}
+        last = {t: state[t][-1]["close"] for t in state}
         pf = {
             "cash": cash,
-            "positions": [{"ticker": t, "quantity": q, "avg_cost": 0.0} for t, q in pos.items() if q > 0],
+            "positions": [{"ticker": t, "quantity": q, "avg_cost": avg_cost.get(t, 0.0)}
+                          for t, q in pos.items() if q > 0],
             "last_prices": last,
         }
         try:
@@ -147,18 +201,22 @@ def simulate(agent_path: Path, mkt: Market, dates: list[str], cost_mult: float =
         except Exception:  # noqa: BLE001
             errors += 1
             orders = []
-        pending = [o for o in orders if o.get("side") in ("buy", "sell") and float(o.get("quantity", 0)) > 0]
-    peak, mdd = curve[0], 0.0
+        pending = orders if isinstance(orders, list) else []
+    peak, mdd = start_equity, 0.0
     for v in curve:
         peak = max(peak, v)
         mdd = max(mdd, 1 - v / peak)
-    ret = curve[-1] / START_CASH - 1
+    ret = curve[-1] / start_equity - 1
     avg_equity = sum(curve) / len(curve)
-    return {"ret": ret, "mdd": mdd, "trades": trades, "curve": curve, "gross": peak_gross,
-            "conc": peak_conc, "conc_streak": max_streak, "errors": errors,
-            "avg_gross": sum(gross_path) / len(gross_path), "gross_path": gross_path, "probes": probes,
-            "turnover": traded / avg_equity, "costs": costs, "sharpe": sharpe(curve),
-            "calmar": (annualize(ret, len(curve)) / mdd) if mdd > 1e-9 else 0.0}
+    out = {"ret": ret, "mdd": mdd, "trades": trades, "curve": curve, "gross": peak_gross,
+           "gross_open": peak_gross_open, "conc": peak_conc, "conc_streak": max_streak, "errors": errors,
+           "avg_gross": sum(gross_path) / len(gross_path), "gross_path": gross_path, "probes": probes,
+           "turnover": traded / avg_equity, "costs": costs, "capped_buys": capped,
+           "sharpe": sharpe(curve), "calmar": (annualize(ret, len(curve)) / mdd) if mdd > 1e-9 else 0.0,
+           "start_equity": start_equity}
+    if record:
+        out.update(fills=fills, books=books)
+    return out
 
 
 def sharpe(curve: list[float]) -> float:
