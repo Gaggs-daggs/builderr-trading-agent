@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
 .DS_Store
 *.log
 local_test_output/
@@ -13,3 +14,7 @@ data_cache/
 # private entrants' code — scored locally, never published
 private_agents/
 private_endpoint_decisions/
+
+# Alpaca paper runner: run log and per-run records stay local
+logs/
+runs.csv

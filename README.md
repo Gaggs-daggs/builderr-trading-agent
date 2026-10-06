@@ -157,6 +157,52 @@ Or email **inquiries@builderr.ai** for early access / questions.
 
 ---
 
+## Alpaca paper trading (optional, local only)
+
+`alpaca_runner.py` runs `agent.py` unchanged against an **Alpaca paper** account, once per trading day shortly
+before the close (default 15:45 ET). It is separate from the builderr submission: nothing here is sent to builderr.
+
+**Setup**
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install alpaca-py      # the runner needs alpaca-py; agent.py does not
+export ALPACA_API_KEY=...        # paper-trading key id   (environment variables only, never a file in the repo)
+export ALPACA_SECRET_KEY=...     # paper-trading secret
+```
+
+Keep the keys in a `.env` you load yourself (`set -a; . ./.env; set +a`); `.env`, `logs/` and `runs.csv` are git-ignored.
+The runner reads the keys from the environment only, hard-codes `paper=True`, refuses to start unless the trading
+endpoint is `paper-api.alpaca.markets`, and redacts the keys from every log line.
+
+**Run**
+
+```bash
+.venv/bin/python alpaca_runner.py --allow-closed     # dry run (the default): prints the orders, sends nothing; works any time
+.venv/bin/python alpaca_runner.py --now              # dry run during market hours, outside the 15:45 window
+.venv/bin/python alpaca_runner.py --live-paper       # submits market orders to the PAPER account (in the 15:45-15:55 ET window)
+```
+
+What a run does: fetch 42 tickers of adjusted daily bars (the same feed and up to 309 bars per ticker that
+`live_runner.py` gives `decide()`), positions and cash, call `decide()`, convert orders to whole-share market orders
+(sells first, at most 45), then check the **intended post-trade book** and abort the whole run if beta-adjusted gross
+would exceed 1.45x, any position 28%, or the orders would use margin. Sells are waited on before buys are sent, and
+buys are re-sized to the cash actually left. It **skips** (sends nothing) when the market is closed, outside the run
+window, data is stale or missing, `decide()` fails, orders are already open, the account is blocked, or it already
+submitted today. Every run, including dry runs and skips, appends a row to `runs.csv`.
+
+The paper account should be dedicated to this bot. Positions the bot doesn't hold by design abort the run; pass
+`--liquidate-foreign` to let it sell them as stray positions (they must be in the 42-ticker feed).
+
+**Daily scheduling.** The runner only acts inside its window and only once per day, so over-scheduling is safe.
+- Linux (cronie): `CRON_TZ=America/New_York`, then `45,50 15 * * 1-5 cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python alpaca_runner.py --live-paper >> logs/cron.log 2>&1`
+- macOS: a launchd job with two `StartCalendarInterval` entries at 15:45 and 15:50 ET converted to your local time (launchd has no time-zone setting), running the same command through `/bin/zsh -lc`.
+
+**How it differs from the scoring engine**: the engine decides on the prior close and fills at the next open; the
+runner decides on bars that include today's partial bar at ~15:45 and trades at ~15:45 (about the close). The free
+Alpaca feed (`--feed iex`) is IEX-only, not the consolidated tape yfinance uses, so prices differ slightly; `--feed sip`
+needs a paid plan. It trades once a day: this is a daily-bar strategy, not an intraday one. Run
+`python test_alpaca_runner.py` for the mocked-client tests (adapter tests run if alpaca-py is installed).
+
 ## Examples
 
 - `baseline.py` — equal-weight buy-and-hold SPY+QQQ
