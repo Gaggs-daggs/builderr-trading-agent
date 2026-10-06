@@ -15,9 +15,10 @@ trade above, plus a QQQ volatility gate for the levered tier:
   OFF   otherwise                         -> staples/healthcare/utilities/gold
 
 Averaging several lookbacks instead of a single SMA200 switch keeps the
-regime call from hinging on one arbitrary number. A fast crash brake (QQQ
-10-day vol > 45% or 5-day return < -7%) caps the tier at HALF, since the slow
-averages lag a sharp break.
+regime call from hinging on one arbitrary number, and averaging the score over
+the last 3 sessions keeps one noisy close from flipping the tier. A fast crash
+brake (QQQ 10-day vol > 45% or 5-day return < -7%) is not smoothed and caps
+the tier at HALF, since the slow averages lag a sharp break.
 
 No network, no LLM, standard library only, stateless (no module globals), so
 it behaves the same whether the engine reuses the process or not. Every
@@ -34,6 +35,7 @@ TREND_LOOKBACKS = (50, 100, 150, 200, 250)
 ON_SCORE = 0.8
 MID_SCORE = 0.4
 HALF_SCORE = 0.2
+SMOOTH_DAYS = 3            # average the trend score over this many sessions
 VOL_LOOKBACK = 20
 VOL_ON = 0.28
 CRASH_VOL10 = 0.45         # QQQ 10-day realized vol above this -> crash brake
@@ -47,6 +49,7 @@ FORCE_TRIM_GROSS = 1.42    # live gross that forces a rebalance
 DRIFT = 0.05               # rebalance when any weight is off target by this much
 MIN_TRADE_PCT = 0.02
 CASH_BUFFER = 0.995
+MAX_ORDERS = 45            # per call; contest limit is 50 trades/day (sells come first)
 
 BOOK_ON = {"TQQQ": 0.15, "QLD": 0.25, "QQQ": 0.27, "SMH": 0.20}
 BOOK_MID = {"QQQ": 0.27, "SPY": 0.27, "XLK": 0.20, "SMH": 0.15}
@@ -87,18 +90,27 @@ def _vol(closes: Optional[list[float]], n: int) -> Optional[float]:
     return pstdev(rets) * math.sqrt(252.0) if len(rets) > 1 else None
 
 
-def trend_score(market_state: Any) -> float:
-    """Fraction of (lookback, index) pairs where the index closes above its SMA."""
+def trend_score(market_state: Any, days_back: int = 0) -> float:
+    """Fraction of (lookback, index) pairs where the index closes above its SMA,
+    measured `days_back` sessions ago (recomputed from bars, so no state is kept)."""
     votes: list[bool] = []
     for ticker in ("QQQ", "SPY"):
         closes = _closes(market_state, ticker)
-        if not closes:
+        if not closes or len(closes) <= days_back:
             continue
+        if days_back:
+            closes = closes[:-days_back]
         for n in TREND_LOOKBACKS:
             sma = _sma(closes, n)
             if sma is not None:
                 votes.append(closes[-1] > sma)
     return sum(votes) / len(votes) if votes else 0.0
+
+
+def smoothed_score(market_state: Any) -> float:
+    """Trend score averaged over the last SMOOTH_DAYS sessions. A single noisy close
+    can no longer flip the tier, which roughly halves turnover from whipsaw."""
+    return sum(trend_score(market_state, k) for k in range(SMOOTH_DAYS)) / SMOOTH_DAYS
 
 
 _RANK = {"OFF": 0, "HALF": 1, "MID": 2, "ON": 3}
@@ -115,7 +127,7 @@ def crash_brake(market_state: Any) -> bool:
 
 
 def regime(market_state: Any) -> str:
-    score = trend_score(market_state)
+    score = smoothed_score(market_state)
     vol = _vol(_closes(market_state, "QQQ"), VOL_LOOKBACK)
     if score >= ON_SCORE and vol is not None and vol < VOL_ON:
         tier = "ON"
@@ -218,4 +230,4 @@ def _run(market_state: Any, portfolio_state: dict, cash: float) -> list[dict]:
             if qty > 0:
                 orders.append({"ticker": ticker, "side": "buy", "quantity": float(qty)})
                 spendable -= qty * px
-    return [o for o in orders if o["quantity"] > 0.0]
+    return [o for o in orders if o["quantity"] > 0.0][:MAX_ORDERS]

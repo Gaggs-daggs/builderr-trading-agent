@@ -87,38 +87,55 @@ def load(path: Path):
     return mod.decide
 
 
-def simulate(agent_path: Path, mkt: Market, dates: list[str]) -> dict:
+def simulate(agent_path: Path, mkt: Market, dates: list[str], cost_mult: float = 1.0, probe=None) -> dict:
+    """Run one fresh agent over `dates`. Orders decided on day t's close fill at day t+1's open.
+
+    cost_mult scales slippage (1.0 = 5 bps plain / 10 bps leveraged). `probe(state)`, if given,
+    is called on each day's market view and its result recorded (e.g. the agent's regime).
+    """
     decide = load(agent_path)
     cash, pos, pending = START_CASH, {}, []
-    curve, trades, peak_gross, peak_conc, errors = [], 0, 0.0, 0.0, 0
+    curve, gross_path, probes = [], [], []
+    trades, traded, costs, errors = 0, 0.0, 0.0, 0
+    peak_gross, peak_conc, streak, max_streak = 0.0, 0.0, {}, 0
     for date in dates:
         for o in pending:
             px = mkt.px(o["ticker"], date, "open")
             if px is None:
                 continue
-            slip = 0.001 if beta(o["ticker"]) > 1 else 0.0005
+            slip = (0.001 if beta(o["ticker"]) > 1 else 0.0005) * cost_mult
             if o["side"] == "buy":
                 fill = px * (1 + slip)
                 qty = min(o["quantity"], cash / fill)
                 if qty > 0:
                     pos[o["ticker"]] = pos.get(o["ticker"], 0.0) + qty
                     cash -= qty * fill
-                    trades += 1
             else:
                 qty = min(o["quantity"], pos.get(o["ticker"], 0.0))
                 if qty > 0:
                     pos[o["ticker"]] -= qty
                     cash += qty * px * (1 - slip)
-                    trades += 1
+            if qty > 0:
+                trades += 1
+                traded += qty * px
+                costs += qty * px * slip
         pending = []
         prices = {t: mkt.px(t, date, "close") for t in pos if pos[t] > 0}
         prices = {t: p for t, p in prices.items() if p is not None}
         value = {t: pos[t] * prices.get(t, 0.0) for t in pos}
         equity = max(cash + sum(value.values()), 1e-9)
         curve.append(equity)
-        peak_gross = max(peak_gross, sum(v * beta(t) for t, v in value.items()) / equity)
-        peak_conc = max([peak_conc] + [v / equity for v in value.values()])
+        gross = sum(v * beta(t) for t, v in value.items()) / equity
+        gross_path.append(gross)
+        peak_gross = max(peak_gross, gross)
+        for t, v in value.items():
+            w = v / equity
+            peak_conc = max(peak_conc, w)
+            streak[t] = streak.get(t, 0) + 1 if w >= 0.30 else 0
+            max_streak = max(max_streak, streak[t])
         state = LazyState(mkt, date)
+        if probe is not None:
+            probes.append(probe(state))
         last = {t: state[t][-1]["close"] for t in state if t in pos or t in ("SPY", "QQQ")}
         pf = {
             "cash": cash,
@@ -135,8 +152,26 @@ def simulate(agent_path: Path, mkt: Market, dates: list[str]) -> dict:
     for v in curve:
         peak = max(peak, v)
         mdd = max(mdd, 1 - v / peak)
-    return {"ret": curve[-1] / START_CASH - 1, "mdd": mdd, "trades": trades, "curve": curve,
-            "gross": peak_gross, "conc": peak_conc, "errors": errors}
+    ret = curve[-1] / START_CASH - 1
+    avg_equity = sum(curve) / len(curve)
+    return {"ret": ret, "mdd": mdd, "trades": trades, "curve": curve, "gross": peak_gross,
+            "conc": peak_conc, "conc_streak": max_streak, "errors": errors,
+            "avg_gross": sum(gross_path) / len(gross_path), "gross_path": gross_path, "probes": probes,
+            "turnover": traded / avg_equity, "costs": costs, "sharpe": sharpe(curve),
+            "calmar": (annualize(ret, len(curve)) / mdd) if mdd > 1e-9 else 0.0}
+
+
+def sharpe(curve: list[float]) -> float:
+    rets = [curve[i] / curve[i - 1] - 1 for i in range(1, len(curve))]
+    if len(rets) < 2:
+        return 0.0
+    mean = sum(rets) / len(rets)
+    sd = math.sqrt(sum((r - mean) ** 2 for r in rets) / (len(rets) - 1))
+    return mean / sd * math.sqrt(252) if sd > 1e-12 else 0.0
+
+
+def annualize(ret: float, days: int) -> float:
+    return (1 + ret) ** (252 / days) - 1 if days > 0 else 0.0
 
 
 def bh(mkt: Market, t: str, dates: list[str]) -> float:
@@ -186,6 +221,42 @@ def evaluate(agent_path: Path, mkt: Market | None = None, quiet: bool = False) -
     return out
 
 
+# Fixed stress/character windows (evaluation only; the agent never sees these dates).
+SCENARIOS = [
+    ("choppy sideways 2018", "2018-01-29", "2018-09-28"),
+    ("crash Q4 2018", "2018-10-01", "2018-12-31"),
+    ("vol spike + snapback 2020", "2020-02-19", "2020-06-30"),
+    ("bear market 2022", "2022-01-03", "2022-12-30"),
+    ("strong bull 2023", "2023-01-03", "2023-07-31"),
+    ("crash + snapback 2025", "2025-02-19", "2025-06-30"),
+]
+
+
+def scenarios(agent_path: Path, mkt: Market, cost_mult: float = 1.0) -> list[dict]:
+    out = []
+    windows = [(n, [d for d in mkt.cal if a <= d <= b]) for n, a, b in SCENARIOS]
+    windows.append(("most recent 60 days", mkt.cal[-WINDOW:]))
+    for name, dates in windows:
+        r = simulate(agent_path, mkt, dates, cost_mult)
+        r.update(name=name, qqq=bh(mkt, "QQQ", dates), days=len(dates))
+        out.append(r)
+    return out
+
+
+def scenario_table(label: str, rows: list[dict]) -> None:
+    print(f"=== {label} ===")
+    print(f"  {'window':27s} {'ret':>7s} {'maxDD':>6s} {'Sharpe':>6s} {'Calmar':>7s} {'turn':>5s} {'trades':>6s} "
+          f"{'avgGross':>8s} {'pkGross':>7s} {'pkConc':>6s} {'QQQ':>7s}")
+    for r in rows:
+        print(f"  {r['name']:27s} {r['ret']*100:6.2f}% {r['mdd']*100:5.1f}% {r['sharpe']:6.2f} {r['calmar']:7.2f} "
+              f"{r['turnover']:5.1f} {r['trades']:6d} {r['avg_gross']:7.2f}x {r['gross']:6.2f}x {r['conc']*100:5.0f}% "
+              f"{r['qqq']*100:6.2f}%")
+    rets = sorted(r["ret"] for r in rows)
+    worst = min(rows, key=lambda r: r["ret"])
+    print(f"  {'median window':27s} {rets[len(rets) // 2]*100:6.2f}%   |  worst: {worst['name']} "
+          f"{worst['ret']*100:.2f}% (DD {max(r['mdd'] for r in rows)*100:.1f}% worst DD)")
+
+
 def report(name: str, o: dict) -> None:
     print(f"=== {name} ===")
     for k in ("train", "test"):
@@ -203,4 +274,6 @@ def report(name: str, o: dict) -> None:
 if __name__ == "__main__":
     m = Market(json.load(open(DATA)))
     for p in sys.argv[1:] or ["agent.py"]:
-        evaluate(HERE / p if not Path(p).is_absolute() else Path(p), m)
+        path = HERE / p if not Path(p).is_absolute() else Path(p)
+        evaluate(path, m)
+        scenario_table(f"{path.name} — stress windows (5/10 bps slippage)", scenarios(path, m))
