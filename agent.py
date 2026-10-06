@@ -1,22 +1,28 @@
-"""Ridgeline — trend-following with inverse-volatility sizing and a 3-tier de-risk ladder.
+"""Trendline — a trend-tiered beta core built from liquid ETFs.
 
-Contest objective: maximize risk-adjusted return (return / max drawdown), not raw return.
-Beat the Round 1 winner (Arnav): a CASH/NEUTRAL/FULL momentum rotator with a trailing stop
-and drawdown taper. This agent keeps that same discipline (trend filter, breadth, vol brake,
-trailing stops, drawdown tapering, cooldowns/hysteresis) and improves on two levers that most
-directly move Calmar:
+Why this design: on a 10-year walk-forward test with no hindsight in the
+ticker list, short-horizon stock/sector momentum rotation trailed plain
+QQQ/SPY exposure. What held up was simpler: own the market, size exposure by
+how broadly the trend is intact, and use the allowed leverage only when the
+trend is broad and volatility is calm.
 
-  1. Inverse-volatility sizing within the leader basket, instead of rank-linear sizing. Two
-     names with the same momentum score but different volatility get different weight — the
-     calmer one gets more. This lowers basket variance without giving up participation.
-  2. A DEFENSIVE tier between NEUTRAL and CASH. Going instantly from fully invested to 100%
-     cash on the first trend break is itself a lurch; a brief DEFENSIVE step (low-vol
-     staples/utilities/healthcare at reduced size) smooths the exit and gives the hysteresis
-     band room to work without either whipsawing or staying exposed too long.
+Regime = fraction of trend lookbacks (SMA50..SMA250) that QQQ and SPY both
+trade above, plus a QQQ volatility gate for the levered tier:
 
-No network calls, no LLM, no third-party packages — pure standard library, deterministic,
-long-only. Every target weight stays under the 30% concentration cap; beta-adjusted gross is
-clamped under the 1.5x leverage cap.
+  ON    score >= 0.8 and QQQ vol20 < 28%  -> levered Nasdaq book (~1.35x beta)
+  MID   score >= 0.4                      -> unlevered QQQ/SPY/tech book
+  HALF  score >= 0.2                      -> half equity, half defensive
+  OFF   otherwise                         -> staples/healthcare/utilities/gold
+
+Averaging several lookbacks instead of a single SMA200 switch keeps the
+regime call from hinging on one arbitrary number. A fast crash brake (QQQ
+10-day vol > 45% or 5-day return < -7%) caps the tier at HALF, since the slow
+averages lag a sharp break.
+
+No network, no LLM, standard library only, stateless (no module globals), so
+it behaves the same whether the engine reuses the process or not. Every
+target stays under CAP; beta-adjusted gross is clamped under MAX_BETA_GROSS;
+a rebalance is forced whenever live weights drift near either contest limit.
 """
 from __future__ import annotations
 
@@ -24,77 +30,28 @@ import math
 from statistics import pstdev
 from typing import Any, Optional
 
-# ---------------------------------------------------------------------------
-# Fixed parameters. Changing any of these ±20% should not collapse behavior —
-# that is the "don't curve-fit" check from AGENT_BRIEF.md.
-# ---------------------------------------------------------------------------
-MOM_LONG = 42
-MOM_SHORT = 21
-MOM_W_LONG = 0.50
-MOM_W_SHORT = 0.30
-MOM_W_GAP = 0.20
-NAME_SMA = 50
-IDX_SMA_FAST = 20
-IDX_SMA_SLOW = 50
-ENTER_BAND = 0.01
-EXIT_BAND = 0.01
+TREND_LOOKBACKS = (50, 100, 150, 200, 250)
+ON_SCORE = 0.8
+MID_SCORE = 0.4
+HALF_SCORE = 0.2
 VOL_LOOKBACK = 20
-VOL_BRAKE_LOOKBACK = 10
-VOL_FULL_MAX = 0.30
-BRAKE_VOL10 = 0.50
-BRAKE_R3 = -0.05
-BREADTH_MIN = 0.50
-TOP_N_MAX = 5
-NAME_CAP = 0.26
-CORE_FULL = 0.67
-CORE_NEUTRAL = 0.85
-CORE_DEFENSIVE = 0.45
-SLEEVE_DOLLAR_FULL = 0.33
-MAX_BETA_GROSS = 1.45
-DD_HALF = -0.06
-DD_LOCK = -0.10
-TAPER_HALF = 0.50
-TAPER_LOCK = 0.25
-TRAIL_STOP = 0.075
-STOP_COOLDOWN_DAYS = 3
-REBALANCE_DAYS = 3
-COOLDOWN_DAYS = 3
-DRIFT_LIMIT = 0.28
-MIN_TRADE_PCT = 0.03
-CASH_BUFFER = 0.98
-MAX_ORDERS = 45
-MIN_BARS = 51
-MIN_VOL_FLOOR = 0.08  # avoid dividing by ~0 vol on a freakishly quiet name
-CORR_LOOKBACK = 40   # trading days of daily returns used for the correlation check
-CORR_MAX = 0.80      # above this, two "different" picks are really the same bet
+VOL_ON = 0.28
+CRASH_VOL10 = 0.45         # QQQ 10-day realized vol above this -> crash brake
+CRASH_RET5 = -0.07         # QQQ 5-day return below this -> crash brake
+CRASH_REGIME = "HALF"      # the most exposure allowed while the brake is on
 
-# A genuine V-recovery shows a strong short-horizon thrust on QQQ; lets a
-# CASH -> DEFENSIVE re-entry fire without waiting for the slow SMA50 reclaim.
-# Purely additive: never overrides the brake, never reaches FULL, never levers.
-THRUST_LOOKBACK = 10
-THRUST_MIN_RET = 0.12
+CAP = 0.27                 # target weight per ticker (contest limit: < 30%)
+FORCE_TRIM_WEIGHT = 0.29   # live weight that forces a rebalance
+MAX_BETA_GROSS = 1.35      # target beta-adjusted gross (contest limit: 1.5x)
+FORCE_TRIM_GROSS = 1.42    # live gross that forces a rebalance
+DRIFT = 0.05               # rebalance when any weight is off target by this much
+MIN_TRADE_PCT = 0.02
+CASH_BUFFER = 0.995
 
-INDEX_REF = ("SPY", "QQQ")
-
-# The full round-frozen tradable universe (universe.json), minus the leveraged
-# names in BETA — those stay gated to the dedicated FULL-only SLEEVE below so
-# leverage never sneaks in through the general momentum ranker. Scanning the
-# whole ~1000-name universe (instead of a hand-picked ~36) means the agent can
-# catch a genuine leader wherever it shows up, and the breadth read (how much
-# of the market is actually healthy) is a real market-wide signal rather than
-# a guess from a small hand-picked sample.
-UNIVERSE_TICKERS: tuple[str, ...] = (
-    "NVDA", "MSFT", "AAPL", "META", "AMZN", "GOOGL", "AVGO", "AMD", "MU", "MRVL",
-    "NFLX", "TSLA", "PLTR", "ORCL", "CRM", "JPM", "V", "MA", "COST", "LLY",
-    "QQQ", "SPY", "SMH", "XLK", "XLC", "XLY", "XLF", "XLI", "XLE", "XLV",
-    "XLP", "XLU", "XLRE", "DIA", "IWM", "SOXX",
-)
-
-# 2x ETF sleeve — bought ONLY in the FULL state.
-SLEEVE = ("QLD", "SSO")
-
-# Defensive basket used only in the DEFENSIVE tier — low-beta, non-cyclical.
-DEFENSIVE_BASKET = (("XLP", 0.40), ("XLU", 0.35), ("XLV", 0.25))
+BOOK_ON = {"TQQQ": 0.15, "QLD": 0.25, "QQQ": 0.27, "SMH": 0.20}
+BOOK_MID = {"QQQ": 0.27, "SPY": 0.27, "XLK": 0.20, "SMH": 0.15}
+BOOK_HALF = {"QQQ": 0.20, "SPY": 0.20, "XLP": 0.15, "XLV": 0.10, "GLD": 0.10}
+BOOK_OFF = {"XLP": 0.20, "XLU": 0.15, "XLV": 0.15, "GLD": 0.20}
 
 BETA: dict[str, float] = {
     "QLD": 2.0, "SSO": 2.0, "DDM": 2.0, "ROM": 2.0, "UWM": 2.0, "AGQ": 2.0,
@@ -102,648 +59,163 @@ BETA: dict[str, float] = {
     "TECL": 3.0, "LABU": 3.0, "CURE": 3.0, "DRN": 3.0, "UDOW": 3.0, "NAIL": 3.0,
 }
 
-_STATE_RANK = {"CASH": 0, "DEFENSIVE": 1, "NEUTRAL": 2, "FULL": 3}
 
-# ---------------------------------------------------------------------------
-# Persistent state. The engine runs each regime/round in a fresh process, so
-# these globals are the agent's only memory across calls.
-# ---------------------------------------------------------------------------
-_state: str = "NEUTRAL"
-_prev_state: str = "NEUTRAL"
-_prev_taper_mult: float = 1.0
-_cooldown: int = 0
-_peak_equity: float = 0.0
-_pos_high: dict[str, float] = {}
-_stop_block: dict[str, int] = {}
-_last_rebalance_date: Optional[str] = None
-_last_seen_date: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Feature helpers — pure functions over close-price series (oldest first).
-# ---------------------------------------------------------------------------
 def _beta(ticker: str) -> float:
     return BETA.get(ticker, 1.0)
 
 
-def _date_of(ts: Any) -> str:
-    return str(ts)[:10]
-
-
-def _closes_of(market_state: dict, ticker: str, cache: dict) -> Optional[list[float]]:
-    if ticker in cache:
-        return cache[ticker]
-    closes: Optional[list[float]] = None
+def _closes(market_state: Any, ticker: str) -> Optional[list[float]]:
     bars = market_state.get(ticker)
-    if bars:
-        try:
-            closes = [float(b["close"]) for b in bars]
-        except (KeyError, TypeError, ValueError):
-            closes = None
-    cache[ticker] = closes
-    return closes
-
-
-def _computable(closes: Optional[list[float]]) -> bool:
-    return closes is not None and len(closes) >= MIN_BARS and closes[-1] > 0.0
+    if not bars:
+        return None
+    try:
+        closes = [float(b["close"]) for b in bars]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return closes if closes[-1] > 0.0 else None
 
 
 def _sma(closes: list[float], n: int) -> Optional[float]:
-    if len(closes) < n:
-        return None
-    return sum(closes[-n:]) / n
+    return sum(closes[-n:]) / n if len(closes) >= n else None
 
 
-def _ret(closes: list[float], k: int) -> Optional[float]:
-    if len(closes) < k + 1:
-        return None
-    start = closes[-(k + 1)]
-    if start <= 0.0:
-        return None
-    return closes[-1] / start - 1.0
-
-
-def _vol(closes: list[float], n: int) -> Optional[float]:
-    if len(closes) < n + 1:
+def _vol(closes: Optional[list[float]], n: int) -> Optional[float]:
+    if not closes or len(closes) < n + 1:
         return None
     window = closes[-(n + 1):]
-    rets: list[float] = []
-    for i in range(1, len(window)):
-        prev = window[i - 1]
-        if prev <= 0.0:
-            return None
-        rets.append(window[i] / prev - 1.0)
-    if len(rets) < 2:
-        return None
-    return pstdev(rets) * math.sqrt(252.0)
+    rets = [window[i] / window[i - 1] - 1.0 for i in range(1, len(window)) if window[i - 1] > 0.0]
+    return pstdev(rets) * math.sqrt(252.0) if len(rets) > 1 else None
 
 
-def _trend_gap(closes: list[float]) -> Optional[float]:
-    sma50 = _sma(closes, NAME_SMA)
-    if sma50 is None or sma50 <= 0.0:
-        return None
-    return closes[-1] / sma50 - 1.0
-
-
-def _momentum_score(closes: list[float]) -> Optional[float]:
-    r_long = _ret(closes, MOM_LONG)
-    r_short = _ret(closes, MOM_SHORT)
-    gap = _trend_gap(closes)
-    if r_long is None or r_short is None or gap is None:
-        return None
-    return MOM_W_LONG * r_long + MOM_W_SHORT * r_short + MOM_W_GAP * gap
-
-
-def _daily_returns(closes: list[float], n: int) -> Optional[list[float]]:
-    """Last n daily returns, oldest first, or None if there isn't enough history."""
-    if len(closes) < n + 1:
-        return None
-    window = closes[-(n + 1):]
-    rets: list[float] = []
-    for i in range(1, len(window)):
-        prev = window[i - 1]
-        if prev <= 0.0:
-            return None
-        rets.append(window[i] / prev - 1.0)
-    return rets
-
-
-def _pearson(a: list[float], b: list[float]) -> float:
-    """Correlation of two return series over their common trailing window."""
-    n = min(len(a), len(b))
-    if n < 5:
-        return 0.0
-    a = a[-n:]
-    b = b[-n:]
-    mean_a = sum(a) / n
-    mean_b = sum(b) / n
-    cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
-    var_a = sum((x - mean_a) ** 2 for x in a)
-    var_b = sum((x - mean_b) ** 2 for x in b)
-    denom = math.sqrt(var_a * var_b)
-    if denom <= 1e-12:
-        return 0.0
-    return cov / denom
-
-
-def _select_diversified(
-    qualifiers: list[tuple[float, str, float]],
-    market_state: dict,
-    cache: dict,
-) -> list[tuple[float, str, float]]:
-    """Greedily take the best-scoring qualifiers, skipping ones too correlated
-    with an already-picked name — so "5 leaders" isn't secretly "1 AI trade
-    wearing 5 tickers". If diversity runs out before TOP_N_MAX slots are
-    filled, the leftover slots are backfilled by score regardless of
-    correlation: being picky about diversification should never be a reason
-    to hold less than the strategy otherwise would.
-    """
-    returns_cache: dict[str, Optional[list[float]]] = {}
-
-    def rets_of(ticker: str) -> Optional[list[float]]:
-        if ticker not in returns_cache:
-            closes = _closes_of(market_state, ticker, cache)
-            returns_cache[ticker] = _daily_returns(closes, CORR_LOOKBACK) if closes else None
-        return returns_cache[ticker]
-
-    selected: list[tuple[float, str, float]] = []
-    skipped: list[tuple[float, str, float]] = []
-    for cand in qualifiers:
-        if len(selected) >= TOP_N_MAX:
-            break
-        cand_rets = rets_of(cand[1])
-        if cand_rets is None:
-            selected.append(cand)  # can't check correlation; don't punish it
+def trend_score(market_state: Any) -> float:
+    """Fraction of (lookback, index) pairs where the index closes above its SMA."""
+    votes: list[bool] = []
+    for ticker in ("QQQ", "SPY"):
+        closes = _closes(market_state, ticker)
+        if not closes:
             continue
-        too_correlated = False
-        for sel in selected:
-            sel_rets = rets_of(sel[1])
-            if sel_rets is not None and _pearson(cand_rets, sel_rets) > CORR_MAX:
-                too_correlated = True
-                break
-        (skipped if too_correlated else selected).append(cand)
-
-    if len(selected) < TOP_N_MAX:
-        for cand in skipped:
-            if len(selected) >= TOP_N_MAX:
-                break
-            if cand not in selected:
-                selected.append(cand)
-
-    selected.sort(key=lambda triple: (-triple[0], triple[1]))
-    return selected[:TOP_N_MAX]
+        for n in TREND_LOOKBACKS:
+            sma = _sma(closes, n)
+            if sma is not None:
+                votes.append(closes[-1] > sma)
+    return sum(votes) / len(votes) if votes else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Portfolio / price helpers.
-# ---------------------------------------------------------------------------
-def _resolve_cash(portfolio_state: dict, cash: float) -> float:
-    try:
-        return float(portfolio_state.get("cash", cash))
-    except (TypeError, ValueError):
-        try:
-            return float(cash)
-        except (TypeError, ValueError):
-            return 0.0
+_RANK = {"OFF": 0, "HALF": 1, "MID": 2, "ON": 3}
 
 
-def _aggregate_positions(portfolio_state: dict) -> dict[str, dict[str, float]]:
-    out: dict[str, dict[str, float]] = {}
-    for raw in portfolio_state.get("positions", []) or []:
-        try:
-            ticker = str(raw["ticker"]).upper()
-            qty = float(raw.get("quantity", 0.0))
-            avg_cost = float(raw.get("avg_cost", 0.0))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if qty <= 0.0:
-            continue
-        if ticker in out:
-            existing = out[ticker]
-            total = existing["quantity"] + qty
-            existing["avg_cost"] = (
-                (existing["avg_cost"] * existing["quantity"] + avg_cost * qty) / total
-                if total > 0.0 else avg_cost
-            )
-            existing["quantity"] = total
-        else:
-            out[ticker] = {"quantity": qty, "avg_cost": avg_cost}
-    return out
+def crash_brake(market_state: Any) -> bool:
+    """Fast-crash detector: the slow trend averages lag a sharp break, this does not."""
+    qqq = _closes(market_state, "QQQ")
+    if not qqq or len(qqq) < 6:
+        return False
+    vol10 = _vol(qqq, 10)
+    ret5 = qqq[-1] / qqq[-6] - 1.0 if qqq[-6] > 0.0 else 0.0
+    return (vol10 is not None and vol10 > CRASH_VOL10) or ret5 < CRASH_RET5
 
 
-def _mark_price(ticker: str, market_state: dict, cache: dict, last_prices: dict) -> Optional[float]:
-    lp = last_prices.get(ticker)
-    try:
-        if lp is not None and float(lp) > 0.0:
-            return float(lp)
-    except (TypeError, ValueError):
-        pass
-    closes = _closes_of(market_state, ticker, cache)
-    if closes and closes[-1] > 0.0:
-        return closes[-1]
-    return None
-
-
-def _exec_price(ticker: str, market_state: dict, cache: dict, last_prices: dict) -> Optional[float]:
-    closes = _closes_of(market_state, ticker, cache)
-    if closes and closes[-1] > 0.0:
-        return closes[-1]
-    lp = last_prices.get(ticker)
-    try:
-        if lp is not None and float(lp) > 0.0:
-            return float(lp)
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-def _compute_equity(positions: dict, market_state: dict, cache: dict, last_prices: dict, cash_value: float) -> float:
-    total = cash_value
-    for ticker in sorted(positions):
-        pos = positions[ticker]
-        price = _mark_price(ticker, market_state, cache, last_prices)
-        if price is None:
-            price = pos["avg_cost"] if pos["avg_cost"] > 0.0 else 0.0
-        total += pos["quantity"] * max(price, 0.0)
-    return max(total, 0.0)
-
-
-# ---------------------------------------------------------------------------
-# Target-weight construction.
-# ---------------------------------------------------------------------------
-def _build_targets(
-    state: str,
-    taper_mult: float,
-    market_state: dict,
-    cache: dict,
-    stop_block: dict[str, int],
-) -> dict[str, float]:
-    weights: dict[str, float] = {}
-    if state == "CASH":
-        return weights
-
-    if state == "DEFENSIVE":
-        budget = CORE_DEFENSIVE * taper_mult
-        for ticker, share in DEFENSIVE_BASKET:
-            if ticker in stop_block:
-                continue
-            if not _computable(_closes_of(market_state, ticker, cache)):
-                continue
-            w = min(budget * share, NAME_CAP)
-            if w > 0.0:
-                weights[ticker] = w
-        return weights
-
-    sleeve_present: list[str] = []
-    if state == "FULL":
-        sleeve_present = [
-            s for s in SLEEVE
-            if s not in stop_block and _computable(_closes_of(market_state, s, cache))
-        ]
-
-    if state == "FULL":
-        core_base = CORE_FULL if sleeve_present else (CORE_FULL + SLEEVE_DOLLAR_FULL)
+def regime(market_state: Any) -> str:
+    score = trend_score(market_state)
+    vol = _vol(_closes(market_state, "QQQ"), VOL_LOOKBACK)
+    if score >= ON_SCORE and vol is not None and vol < VOL_ON:
+        tier = "ON"
+    elif score >= MID_SCORE:
+        tier = "MID"
+    elif score >= HALF_SCORE:
+        tier = "HALF"
     else:
-        core_base = CORE_NEUTRAL
-    core_budget = core_base * taper_mult
+        tier = "OFF"
+    if crash_brake(market_state) and _RANK[tier] > _RANK[CRASH_REGIME]:
+        tier = CRASH_REGIME
+    return tier
 
-    # --- selection: qualify + rank the leader pool by momentum ---
-    qualifiers: list[tuple[float, str, float]] = []
-    for ticker in UNIVERSE_TICKERS:
-        if ticker in stop_block:
-            continue
-        closes = _closes_of(market_state, ticker, cache)
-        if not _computable(closes):
-            continue
-        score = _momentum_score(closes)  # type: ignore[arg-type]
-        if score is None:
-            continue
-        sma50 = _sma(closes, NAME_SMA)  # type: ignore[arg-type]
-        if sma50 is None:
-            continue
-        vol = _vol(closes, VOL_LOOKBACK)  # type: ignore[arg-type]
-        if vol is None:
-            continue
-        if score > 0.0 and closes[-1] > sma50:  # type: ignore[index]
-            qualifiers.append((score, ticker, max(vol, MIN_VOL_FLOOR)))
 
-    qualifiers.sort(key=lambda triple: (-triple[0], triple[1]))
-    selected = _select_diversified(qualifiers, market_state, cache)
-
-    # --- risk-adjusted-momentum sizing: weight by score/vol so a strong,
-    #     calm leader outweighs a strong-but-jumpy one, but raw momentum
-    #     strength still drives most of the split (pure inverse-vol would
-    #     flatten conviction and cap upside in a clean trend). ---
-    if selected:
-        raw = [max(score, 0.0) / vol for score, _, vol in selected]
-        total_raw = sum(raw)
-        if total_raw > 0.0:
-            for (_, ticker, _), r in zip(selected, raw):
-                weight = min(core_budget * r / total_raw, NAME_CAP)
-                if weight > 0.0:
-                    weights[ticker] = weight
-
-    if sleeve_present:
-        per = (SLEEVE_DOLLAR_FULL * taper_mult) / len(sleeve_present)
-        for s in sleeve_present:
-            w = min(per, NAME_CAP)
-            if w > 0.0:
-                weights[s] = w
-
-    beta_gross = sum(w * _beta(t) for t, w in weights.items())
-    if beta_gross > MAX_BETA_GROSS and beta_gross > 0.0:
-        scale = MAX_BETA_GROSS / beta_gross
-        weights = {t: w * scale for t, w in weights.items()}
-
+def target_weights(market_state: Any) -> dict[str, float]:
+    book = {"ON": BOOK_ON, "MID": BOOK_MID, "HALF": BOOK_HALF, "OFF": BOOK_OFF}[regime(market_state)]
+    weights = {t: min(w, CAP) for t, w in book.items() if w > 0.0 and _closes(market_state, t)}
+    gross = sum(w * _beta(t) for t, w in weights.items())
+    if gross > MAX_BETA_GROSS:
+        weights = {t: w * MAX_BETA_GROSS / gross for t, w in weights.items()}
     return weights
 
 
-# ---------------------------------------------------------------------------
-# Order generation — sell-before-buy, deterministic ordering.
-# ---------------------------------------------------------------------------
-def _generate_orders(
-    do_rebalance: bool,
-    weights: dict[str, float],
-    positions: dict[str, dict[str, float]],
-    forced_stops: list[tuple[str, float]],
-    equity: float,
-    market_state: dict,
-    cache: dict,
-    last_prices: dict,
-    cash_value: float,
-) -> list[dict[str, Any]]:
-    orders: list[dict[str, Any]] = []
-    sold: set[str] = set()
-    proceeds = 0.0
-    min_trade = MIN_TRADE_PCT * equity
-
-    for ticker, qty in forced_stops:
-        if qty > 0.0:
-            orders.append({"ticker": ticker, "side": "sell", "quantity": qty})
-            sold.add(ticker)
-            price = _exec_price(ticker, market_state, cache, last_prices)
-            if price is not None:
-                proceeds += qty * price
-
-    if do_rebalance:
-        for ticker in sorted(positions):
-            if ticker in sold:
-                continue
-            held = positions[ticker]["quantity"]
-            if held <= 0.0:
-                continue
-            target_w = weights.get(ticker, 0.0)
-            price = _exec_price(ticker, market_state, cache, last_prices)
-
-            if target_w == 0.0:
-                orders.append({"ticker": ticker, "side": "sell", "quantity": held})
-                sold.add(ticker)
-                if price is not None and price > 0.0:
-                    proceeds += held * price
-                continue
-
-            if price is None or price <= 0.0:
-                continue
-            target_shares = math.floor(target_w * equity / price)
-            delta = target_shares - held
-            if delta < 0 and (-delta) * price >= min_trade:
-                sell_qty = float(int(min(-delta, held)))
-                if sell_qty > 0.0:
-                    orders.append({"ticker": ticker, "side": "sell", "quantity": sell_qty})
-                    sold.add(ticker)
-                    proceeds += sell_qty * price
-
-        spendable = cash_value + CASH_BUFFER * proceeds
-        for ticker in sorted(weights, key=lambda t: (-weights[t], t)):
-            price = _exec_price(ticker, market_state, cache, last_prices)
-            if price is None or price <= 0.0:
-                continue
-            held = positions[ticker]["quantity"] if ticker in positions else 0.0
-            target_shares = math.floor(weights[ticker] * equity / price)
-            deficit = target_shares - held
-            if deficit > 0 and deficit * price >= min_trade:
-                affordable = math.floor(min(deficit * price, spendable) / price)
-                if affordable > 0:
-                    orders.append({"ticker": ticker, "side": "buy", "quantity": float(affordable)})
-                    spendable -= affordable * price
-
-    if len(orders) > MAX_ORDERS:
-        sells = [o for o in orders if o["side"] == "sell"]
-        buys = [o for o in orders if o["side"] == "buy"]
-        orders = (sells + buys)[:MAX_ORDERS]
-
-    return [o for o in orders if o["quantity"] > 0.0]
-
-
-# ---------------------------------------------------------------------------
-# Master decision cycle. `decide` wraps `_run` in a defensive guard so no
-# exception can forfeit the "runs clean" admission gate; on failure it
-# restores the pre-call global snapshot to avoid state desync.
-# ---------------------------------------------------------------------------
 def decide(market_state: dict, portfolio_state: dict, cash: float) -> list[dict]:
-    """Return a list of long-only buy/sell orders for this decision cycle."""
-    global _state, _cooldown, _peak_equity, _pos_high, _stop_block
-    global _last_rebalance_date, _last_seen_date, _prev_state, _prev_taper_mult
-
-    snapshot = (
-        _state, _cooldown, _peak_equity, dict(_pos_high), dict(_stop_block),
-        _last_rebalance_date, _last_seen_date, _prev_state, _prev_taper_mult,
-    )
+    """Return long-only orders moving the book toward the current regime's targets."""
     try:
         return _run(market_state or {}, portfolio_state or {}, cash)
     except Exception:  # noqa: BLE001 — never let a bad tick raise.
-        (
-            _state, _cooldown, _peak_equity, _pos_high, _stop_block,
-            _last_rebalance_date, _last_seen_date, _prev_state, _prev_taper_mult,
-        ) = snapshot
         return []
 
 
-def _run(market_state: dict, portfolio_state: dict, cash: float) -> list[dict[str, Any]]:
-    global _state, _cooldown, _peak_equity, _pos_high, _stop_block
-    global _last_rebalance_date, _last_seen_date, _prev_state, _prev_taper_mult
-
-    if not market_state:
+def _run(market_state: Any, portfolio_state: dict, cash: float) -> list[dict]:
+    if not market_state or not _closes(market_state, "QQQ"):
         return []
+    try:
+        cash_value = float(portfolio_state.get("cash", cash))
+    except (TypeError, ValueError):
+        cash_value = float(cash or 0.0)
+    last_prices = {str(k).upper(): v for k, v in (portfolio_state.get("last_prices") or {}).items()}
 
-    cache: dict[str, Optional[list[float]]] = {}
-    last_prices: dict[str, Any] = {}
-    for key, value in (portfolio_state.get("last_prices", {}) or {}).items():
-        last_prices[str(key).upper()] = value
-    cash_value = _resolve_cash(portfolio_state, cash)
+    held: dict[str, float] = {}
+    for raw in portfolio_state.get("positions") or []:
+        try:
+            qty = float(raw.get("quantity", 0.0))
+            ticker = str(raw["ticker"]).upper()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if qty > 0.0:
+            held[ticker] = held.get(ticker, 0.0) + qty
 
-    spy_bars = market_state.get("SPY")
-    spy = _closes_of(market_state, "SPY", cache)
-    qqq = _closes_of(market_state, "QQQ", cache)
-    current_date: Optional[str] = None
-    if spy_bars:
-        ts = spy_bars[-1].get("ts")
-        current_date = _date_of(ts) if ts is not None else str(len(spy_bars))
+    def price(ticker: str) -> Optional[float]:
+        closes = _closes(market_state, ticker)
+        if closes:
+            return closes[-1]
+        try:
+            lp = float(last_prices.get(ticker) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        return lp if lp > 0.0 else None
 
-    # ---- Data guard: if indices aren't computable, liquidate and wait. ----
-    if not _computable(spy) or not _computable(qqq):
-        positions = _aggregate_positions(portfolio_state)
-        orders: list[dict[str, Any]] = []
-        for ticker in sorted(positions):
-            if market_state.get(ticker):
-                qty = positions[ticker]["quantity"]
-                if qty > 0.0:
-                    orders.append({"ticker": ticker, "side": "sell", "quantity": qty})
-        _prev_state = _state
-        _prev_taper_mult = 1.0
-        if current_date is not None:
-            _last_seen_date = current_date
-        return orders
-
-    spy_closes: list[float] = spy  # type: ignore[assignment]
-    qqq_closes: list[float] = qqq  # type: ignore[assignment]
-
-    positions = _aggregate_positions(portfolio_state)
-
-    is_new_day = current_date != _last_seen_date
-    if is_new_day:
-        if _cooldown > 0:
-            _cooldown -= 1
-        if _stop_block:
-            decayed: dict[str, int] = {}
-            for ticker, days in _stop_block.items():
-                remaining = days - 1
-                if remaining > 0:
-                    decayed[ticker] = remaining
-            _stop_block = decayed
-
-    equity = _compute_equity(positions, market_state, cache, last_prices, cash_value)
+    equity = cash_value + sum(q * (price(t) or 0.0) for t, q in held.items())
     if equity <= 0.0:
-        _prev_state = _state
-        _prev_taper_mult = 1.0
-        _last_seen_date = current_date
         return []
-    _peak_equity = max(_peak_equity, equity)
-    dd = (equity / _peak_equity - 1.0) if _peak_equity > 0.0 else 0.0
-    if dd <= DD_LOCK:
-        taper_mult = TAPER_LOCK
-    elif dd <= DD_HALF:
-        taper_mult = TAPER_HALF
-    else:
-        taper_mult = 1.0
 
-    spy_close = spy_closes[-1]
-    qqq_close = qqq_closes[-1]
-    spy_sma_fast = _sma(spy_closes, IDX_SMA_FAST)
-    spy_sma_slow = _sma(spy_closes, IDX_SMA_SLOW)
-    qqq_sma_fast = _sma(qqq_closes, IDX_SMA_FAST)
-    qqq_sma_slow = _sma(qqq_closes, IDX_SMA_SLOW)
-    qqq_vol20 = _vol(qqq_closes, VOL_LOOKBACK)
-    qqq_r3 = _ret(qqq_closes, 3)
-    qqq_vol10 = _vol(qqq_closes, VOL_BRAKE_LOOKBACK)
+    targets = target_weights(market_state)
+    current = {t: q * (price(t) or 0.0) / equity for t, q in held.items()}
+    live_gross = sum(w * _beta(t) for t, w in current.items())
+    near_limit = live_gross > FORCE_TRIM_GROSS or any(w > FORCE_TRIM_WEIGHT for w in current.values())
+    off_target = any(abs(targets.get(t, 0.0) - current.get(t, 0.0)) >= DRIFT for t in set(targets) | set(current))
+    stray = any(t not in targets for t in current)
+    if not (near_limit or off_target or stray):
+        return []
 
-    n_comp = 0
-    n_up = 0
-    for ticker in UNIVERSE_TICKERS:
-        closes = _closes_of(market_state, ticker, cache)
-        if not _computable(closes):
+    orders: list[dict] = []
+    proceeds = 0.0
+    min_trade = MIN_TRADE_PCT * equity
+    for ticker in sorted(held):
+        px = price(ticker)
+        if px is None:
             continue
-        sma50 = _sma(closes, NAME_SMA)  # type: ignore[arg-type]
-        if sma50 is None:
+        goal = targets.get(ticker, 0.0)
+        if goal == 0.0:
+            orders.append({"ticker": ticker, "side": "sell", "quantity": held[ticker]})
+            proceeds += held[ticker] * px
             continue
-        n_comp += 1
-        if closes[-1] > sma50:  # type: ignore[index]
-            n_up += 1
-    breadth = (n_up / n_comp) if n_comp > 0 else 0.0
+        excess = held[ticker] - math.floor(goal * equity / px)
+        forced = current.get(ticker, 0.0) > FORCE_TRIM_WEIGHT or near_limit
+        if excess > 0 and (excess * px >= min_trade or forced):
+            orders.append({"ticker": ticker, "side": "sell", "quantity": float(excess)})
+            proceeds += excess * px
 
-    # ---- State machine: CASH < DEFENSIVE < NEUTRAL < FULL, with hysteresis. ----
-    prev_cycle_state = _state
-    brake_fired = (
-        (qqq_r3 is not None and qqq_r3 < BRAKE_R3)
-        or (qqq_vol10 is not None and qqq_vol10 > BRAKE_VOL10)
-    )
-    hard_cash = (
-        brake_fired
-        or (spy_sma_slow is not None and spy_close < spy_sma_slow * (1.0 - EXIT_BAND))
-        or (qqq_sma_slow is not None and qqq_close < qqq_sma_slow * (1.0 - EXIT_BAND))
-    )
-    # Leaving CASH requires a clear reclaim (both indices above SMA50*(1+band)),
-    # not merely clearing the trigger — a hysteresis band that removes
-    # liquidate/re-buy whipsaw in choppy tape.
-    reclaim = (
-        spy_sma_slow is not None and spy_close > spy_sma_slow * (1.0 + ENTER_BAND)
-        and qqq_sma_slow is not None and qqq_close > qqq_sma_slow * (1.0 + ENTER_BAND)
-    )
-    qqq_ret10 = _ret(qqq_closes, THRUST_LOOKBACK)
-    thrust_signal = (
-        qqq_ret10 is not None and qqq_ret10 > THRUST_MIN_RET
-        and qqq_sma_fast is not None and qqq_close > qqq_sma_fast
-        and len(qqq_closes) >= 2 and qqq_close > qqq_closes[-2]
-    )
-    if prev_cycle_state == "CASH" and not brake_fired and not reclaim and thrust_signal:
-        _state = "DEFENSIVE"  # thrust override: step out of cash, not straight to FULL
-    elif hard_cash:
-        _state = "CASH"
-        _cooldown = COOLDOWN_DAYS
-    elif prev_cycle_state == "CASH" and not reclaim:
-        _state = "CASH"  # hysteresis hold: stay in cash until a clear reclaim
-    elif prev_cycle_state in ("CASH", "DEFENSIVE") and not reclaim:
-        _state = "DEFENSIVE"  # soft landing on the way out of a de-risked state
-    elif _cooldown > 0:
-        _state = "NEUTRAL"
-    else:
-        full_conditions = (
-            spy_sma_fast is not None and spy_close > spy_sma_fast
-            and qqq_sma_fast is not None and qqq_close > qqq_sma_fast
-            and spy_sma_slow is not None and spy_close > spy_sma_slow * (1.0 + ENTER_BAND)
-            and qqq_sma_slow is not None and qqq_close > qqq_sma_slow * (1.0 + ENTER_BAND)
-            and breadth >= BREADTH_MIN
-            and qqq_vol20 is not None and qqq_vol20 < VOL_FULL_MAX
-        )
-        _state = "FULL" if full_conditions else "NEUTRAL"
-
-    # Re-entering from CASH: refresh the high-water mark to right now, so the
-    # drawdown taper measures risk from the point of re-entry forward, not
-    # against a peak set BEFORE the agent had already de-risked. Otherwise a
-    # strong pre-cash-out rally makes the very next re-entry look artificially
-    # risky and gets throttled by a taper that has nothing to do with the
-    # agent's actual current exposure -- it punishes having already protected
-    # the account, exactly backwards from the taper's purpose.
-    if prev_cycle_state == "CASH" and _state != "CASH":
-        _peak_equity = equity
-        dd = 0.0
-        taper_mult = 1.0
-
-    # ---- Trailing-stop updates (every cycle). ----
-    for ticker in list(_pos_high):
-        if ticker not in positions:
-            del _pos_high[ticker]
-    forced_stops: list[tuple[str, float]] = []
-    for ticker in sorted(positions):
-        price = _exec_price(ticker, market_state, cache, last_prices)
-        if price is None:
+    spendable = cash_value + CASH_BUFFER * proceeds
+    for ticker in sorted(targets, key=lambda t: (-targets[t], t)):
+        px = price(ticker)
+        if px is None:
             continue
-        high = _pos_high.get(ticker, price)
-        if price > high:
-            high = price
-        _pos_high[ticker] = high
-        if high > 0.0 and price < high * (1.0 - TRAIL_STOP):
-            forced_stops.append((ticker, positions[ticker]["quantity"]))
-            _stop_block[ticker] = STOP_COOLDOWN_DAYS
-            if ticker in _pos_high:
-                del _pos_high[ticker]
-
-    # ---- Rebalance gate. ----
-    if _last_rebalance_date is None:
-        do_rebalance = True
-    else:
-        elapsed_dates: set[str] = set()
-        for bar in spy_bars:
-            ts = bar.get("ts")
-            bar_date = _date_of(ts) if ts is not None else ""
-            if bar_date > _last_rebalance_date:
-                elapsed_dates.add(bar_date)
-        days_since = len(elapsed_dates)
-        derisk_state = _STATE_RANK[_state] < _STATE_RANK[_prev_state]
-        derisk_taper = taper_mult < _prev_taper_mult
-        drift = False
-        for ticker, pos in positions.items():
-            price = _exec_price(ticker, market_state, cache, last_prices)
-            if price is not None and equity > 0.0 and (pos["quantity"] * price / equity) > DRIFT_LIMIT:
-                drift = True
-                break
-        do_rebalance = days_since >= REBALANCE_DAYS or derisk_state or derisk_taper or drift
-    if _last_rebalance_date == current_date:
-        do_rebalance = False
-
-    weights = (
-        _build_targets(_state, taper_mult, market_state, cache, _stop_block)
-        if do_rebalance else {}
-    )
-
-    orders = _generate_orders(
-        do_rebalance, weights, positions, forced_stops,
-        equity, market_state, cache, last_prices, cash_value,
-    )
-    if do_rebalance and len(orders) >= 1:
-        _last_rebalance_date = current_date
-
-    _prev_state = _state
-    _prev_taper_mult = taper_mult
-    _last_seen_date = current_date
-    return orders
+        need = math.floor(targets[ticker] * equity / px) - held.get(ticker, 0.0)
+        if need > 0 and need * px >= min_trade:
+            qty = math.floor(min(need * px, spendable) / px)
+            if qty > 0:
+                orders.append({"ticker": ticker, "side": "buy", "quantity": float(qty)})
+                spendable -= qty * px
+    return [o for o in orders if o["quantity"] > 0.0]

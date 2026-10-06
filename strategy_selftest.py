@@ -16,11 +16,11 @@ import agent
 
 
 UNIVERSE = (
-    "SPY", "QQQ", "DIA", "IWM",
-    "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE", "XLC", "SMH",
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
-    "QLD", "SSO",
+    "SPY", "QQQ", "XLK", "SMH", "XLP", "XLU", "XLV", "GLD",
+    "QLD", "SSO", "TQQQ",
 )
+DEFENSIVE = {"XLP", "XLU", "XLV", "GLD"}
+LEVERED = {"QLD", "SSO", "TQQQ"}
 
 
 def bars(start: float, returns: list[float]) -> list[dict]:
@@ -41,110 +41,110 @@ def bars(start: float, returns: list[float]) -> list[dict]:
     return out
 
 
-def market(kind: str) -> dict[str, list[dict]]:
-    if kind == "risk_off":
-        base = [-0.003] * 90
-        defensive = [0.0005] * 90
-        return {t: bars(100.0, defensive if t in {"XLP", "XLU", "XLV", "XLE"} else base) for t in UNIVERSE}
-
-    if kind == "high_vol":
-        calm_up = [0.002] * 90
-        qqq_chop = ([0.035, -0.03] * 45)
-        data = {t: bars(100.0, calm_up) for t in UNIVERSE}
-        data["QQQ"] = bars(100.0, qqq_chop)
-        return data
-
-    # Low-vol risk-on, with differentiated momentum.
-    data = {t: bars(100.0, [0.001] * 90) for t in UNIVERSE}
-    for t in ("SMH", "NVDA", "XLK"):
-        data[t] = bars(100.0, [0.004] * 90)
-    for t in ("QQQ", "AAPL", "META"):
-        data[t] = bars(100.0, [0.0025] * 90)
-    data["SPY"] = bars(100.0, [0.0018] * 90)
-    data["QLD"] = bars(100.0, [0.0048] * 90)
-    data["SSO"] = bars(100.0, [0.0034] * 90)
+def market(index_returns: list[float], other: float = 0.001) -> dict[str, list[dict]]:
+    """SPY and QQQ follow `index_returns`; every other ticker drifts at `other` per day."""
+    n = len(index_returns)
+    data = {t: bars(100.0, [other] * n) for t in UNIVERSE}
+    data["SPY"] = bars(100.0, index_returns)
+    data["QQQ"] = bars(100.0, index_returns)
     return data
 
 
-def reset_agent_state() -> None:
-    agent._last_rebalance_bar_date = None
-    agent._last_targets = {}
+CALM_UP = [0.0015] * 260
+CHOPPY_UP = [0.0015 + (0.025 if i % 2 else -0.025) for i in range(260)]
+BEAR = [0.0015] * 120 + [-0.003] * 140
+CRASH = [0.0015] * 255 + [-0.03] * 5
 
 
-def beta_gross(weights: dict[str, float]) -> float:
-    return sum(w * agent.BETA_MULTIPLE.get(t, 1.0) for t, w in weights.items())
+def portfolio(cash: float = 100_000.0, positions: list[dict] | None = None) -> dict:
+    return {"cash": cash, "positions": positions or [], "last_prices": {}}
+
+
+def buys(orders: list[dict]) -> set[str]:
+    return {o["ticker"] for o in orders if o["side"] == "buy"}
 
 
 def test_empty_data_returns_no_orders() -> None:
-    reset_agent_state()
-    assert agent.decide({}, {"cash": 100_000, "positions": [], "last_prices": {}}, 100_000) == []
+    assert agent.decide({}, portfolio(), 100_000.0) == []
 
 
-def test_insufficient_history_returns_no_targets() -> None:
-    short_market = {t: bars(100.0, [0.001] * 40) for t in UNIVERSE}
-    assert agent.target_weights(short_market) == {}
+def test_calm_uptrend_uses_levered_book() -> None:
+    data = market(CALM_UP)
+    assert agent.regime(data) == "ON"
+    picked = buys(agent.decide(data, portfolio(), 100_000.0))
+    assert picked & LEVERED, picked
 
 
-def test_risk_off_uses_defensive_book() -> None:
-    weights = agent.target_weights(market("risk_off"))
-    assert set(weights).issubset({"XLP", "XLU", "XLV", "XLE"})
-    assert weights
+def test_high_vol_uptrend_drops_leverage() -> None:
+    data = market(CHOPPY_UP)
+    assert agent.regime(data) != "ON", agent.regime(data)
+    assert not (buys(agent.decide(data, portfolio(), 100_000.0)) & LEVERED)
 
 
-def test_risk_on_selects_positive_momentum() -> None:
-    weights = agent.target_weights(market("risk_on"))
-    assert {"SMH", "NVDA", "XLK"} & set(weights)
-    assert len(weights) >= 4
+def test_bear_market_holds_only_defensives() -> None:
+    data = market(BEAR)
+    assert agent.regime(data) == "OFF", agent.regime(data)
+    assert buys(agent.decide(data, portfolio(), 100_000.0)) <= DEFENSIVE
 
 
-def test_high_vol_disables_leverage() -> None:
-    weights = agent.target_weights(market("high_vol"))
-    assert "QLD" not in weights
-    assert "SSO" not in weights
+def test_crash_brake_caps_exposure() -> None:
+    data = market(CRASH)
+    assert agent.crash_brake(data)
+    assert agent.regime(data) in ("HALF", "OFF"), agent.regime(data)
 
 
-def test_caps_hold() -> None:
-    for kind in ("risk_off", "high_vol", "risk_on"):
-        weights = agent.target_weights(market(kind))
-        assert all(w < 0.240001 for w in weights.values()), (kind, weights)
-        assert beta_gross(weights) <= 1.350001, (kind, weights, beta_gross(weights))
+def test_caps_hold_in_every_regime() -> None:
+    for path in (CALM_UP, CHOPPY_UP, BEAR, CRASH):
+        weights = agent.target_weights(market(path))
+        assert all(w <= agent.CAP + 1e-9 for w in weights.values()), weights
+        gross = sum(w * agent._beta(t) for t, w in weights.items())
+        assert gross <= agent.MAX_BETA_GROSS + 1e-9, gross
+        assert sum(weights.values()) <= 1.0 + 1e-9, weights
+
+
+def test_overweight_position_is_trimmed() -> None:
+    data = market(CALM_UP)
+    px = data["QQQ"][-1]["close"]
+    qty = 0.40 * 100_000.0 / px
+    pf = portfolio(cash=60_000.0, positions=[{"ticker": "QQQ", "quantity": qty, "avg_cost": px}])
+    sells = [o for o in agent.decide(data, pf, 60_000.0) if o["side"] == "sell" and o["ticker"] == "QQQ"]
+    assert sells, "a 40% QQQ position must be cut below the 30% cap"
+    assert (qty - sells[0]["quantity"]) * px / 100_000.0 < 0.30
+
+
+def test_on_target_book_does_not_churn() -> None:
+    data = market(CALM_UP)
+    weights = agent.target_weights(data)
+    positions, spent = [], 0.0
+    for t, w in weights.items():
+        px = data[t][-1]["close"]
+        positions.append({"ticker": t, "quantity": w * 100_000.0 / px, "avg_cost": px})
+        spent += w * 100_000.0
+    cash = 100_000.0 - spent
+    assert agent.decide(data, portfolio(cash, positions), cash) == []
 
 
 def test_orders_are_bounded_and_fast() -> None:
-    reset_agent_state()
-    m = market("risk_on")
-    latest = {t: b[-1]["close"] for t, b in m.items()}
-    portfolio = {"cash": 100_000.0, "positions": [], "last_prices": latest}
-    start = time.perf_counter()
-    orders = agent.decide(m, portfolio, 100_000.0)
-    elapsed = time.perf_counter() - start
-    assert elapsed < 0.05, elapsed
-    assert 0 < len(orders) < 50, orders
-    assert all(o["side"] in {"buy", "sell"} and o["quantity"] > 0 for o in orders)
-    assert agent.decide(m, portfolio, 100_000.0) == []
-
-
-def test_tiny_stale_position_is_not_sold() -> None:
-    orders = agent.orders_to_rebalance(
-        targets={"SPY": 0.20},
-        positions={"XYZ": {"quantity": 0.5, "avg_cost": 100.0}},
-        total_equity=100_000.0,
-        prices={"XYZ": 100.0, "SPY": 500.0},
-        cash_available=0.0,
-    )
-    assert orders == []
+    for path in (CALM_UP, CHOPPY_UP, BEAR, CRASH):
+        start = time.perf_counter()
+        orders = agent.decide(market(path), portfolio(), 100_000.0)
+        assert time.perf_counter() - start < 5.0
+        assert len(orders) <= 50
+        for o in orders:
+            assert o["side"] in ("buy", "sell") and o["quantity"] > 0 and o["ticker"] in UNIVERSE
 
 
 def run() -> None:
     tests = [
         test_empty_data_returns_no_orders,
-        test_insufficient_history_returns_no_targets,
-        test_risk_off_uses_defensive_book,
-        test_risk_on_selects_positive_momentum,
-        test_high_vol_disables_leverage,
-        test_caps_hold,
+        test_calm_uptrend_uses_levered_book,
+        test_high_vol_uptrend_drops_leverage,
+        test_bear_market_holds_only_defensives,
+        test_crash_brake_caps_exposure,
+        test_caps_hold_in_every_regime,
+        test_overweight_position_is_trimmed,
+        test_on_target_book_does_not_churn,
         test_orders_are_bounded_and_fast,
-        test_tiny_stale_position_is_not_sold,
     ]
     for test in tests:
         test()

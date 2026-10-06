@@ -26,17 +26,19 @@ Fork this repo, implement `decide()` in `agent.py`, then send us the repo — **
 
 > **Secrets:** never commit API keys. You do not need an LLM, brokerage login, or real-money account to enter. If you use an LLM, use endpoint mode or a capped throwaway key.
 
-## Submitted agent: Forward-Return Rotation Hybrid
+## Submitted agent: Trendline (trend-tiered beta core)
 
-`agent.py` is a no-network, no-LLM strategy built for the live forward-return ranking (Round 2: July 7 – October 31, 2026):
+`agent.py` is a no-network, no-LLM, stateless ETF strategy built for the live forward-return ranking (Round 2: July 7 – October 31, 2026):
 
-- **Risk regime:** risk-on only when SPY and QQQ are above their 50-day SMAs and QQQ 20-day volatility is below 35%.
-- **Risk-off book:** XLP / XLU / XLV / XLE with cash left over; no leverage.
-- **Risk-on book:** ranks SPY, QQQ, sector ETFs, SMH, and mega-cap tech by 60-day momentum, 20-day momentum, 50-day trend gap, and volatility.
-- **Tactical overlay:** adds small QLD / SSO exposure only in calm QQQ uptrends; never uses TQQQ or SOXL by default.
-- **Caps:** per-ticker targets stay below 24%, drift rebalance starts above 27%, and beta-adjusted gross is scaled below 1.35x.
+- **Trend score:** the fraction of SMA50/100/150/200/250 that QQQ and SPY both close above.
+- **Tiers:** ON (score ≥ 0.8 and QQQ 20-day vol < 28%) holds TQQQ/QLD/QQQ/SMH at ~1.35x beta. MID holds unlevered QQQ/SPY/XLK/SMH. HALF splits equity and defensives. OFF holds XLP/XLU/XLV/GLD.
+- **Crash brake:** QQQ 10-day vol > 45% or 5-day return < −7% caps exposure at HALF.
+- **Caps:** per-ticker targets ≤ 27% with a forced trim above 29%; beta-adjusted gross targets 1.35x with a forced trim above 1.42x.
 
-Run `python strategy_selftest.py` for strategy-specific cap/regime checks.
+Why this and not stock/sector momentum: on a 10-year walk-forward test (`backtest.py`, 112 rolling 60-day windows, 2017–2026), momentum rotation over a ticker list with no hindsight (the largest US stocks at end-2016, or sector ETFs) made ~4–8% a year, trailing QQQ buy-and-hold (~20%). Trendline made ~20.6% CAGR with a 30% max drawdown, versus QQQ's 35%. Past results on one decade of data are not a forecast.
+
+- `python strategy_selftest.py` — strategy-specific cap/regime checks.
+- `python fetch_history.py && python backtest.py` — the 10-year walk-forward test (downloads public daily bars; not needed for submission).
 
 ---
 
