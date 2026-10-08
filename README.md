@@ -26,19 +26,16 @@ Fork this repo, implement `decide()` in `agent.py`, then send us the repo — **
 
 > **Secrets:** never commit API keys. You do not need an LLM, brokerage login, or real-money account to enter. If you use an LLM, use endpoint mode or a capped throwaway key.
 
-## Submitted agent: Trendline (trend-tiered beta core)
+## Submitted agent: Apex Momentum
 
-`agent.py` is a no-network, no-LLM, stateless ETF strategy built for the live forward-return ranking (Round 2: July 7 – October 31, 2026):
+`agent.py` is a no-network, no-LLM, stdlib-only aggressive momentum strategy:
 
-- **Trend score:** the fraction of SMA50/100/150/200/250 that QQQ and SPY both close above.
-- **Tiers:** ON (score ≥ 0.8 and QQQ 20-day vol < 28%) holds TQQQ/QLD/QQQ/SMH at ~1.35x beta. MID holds unlevered QQQ/SPY/XLK/SMH. HALF splits equity and defensives. OFF holds XLP/XLU/XLV/GLD.
-- **Crash brake:** QQQ 10-day vol > 45% or 5-day return < −7% caps exposure at HALF.
-- **Caps:** per-ticker targets ≤ 27% with a forced trim above 29%; beta-adjusted gross targets 1.35x with a forced trim above 1.42x.
+- **Regime gate:** risk-on only when QQQ and SPY are above their 50-day SMAs, QQQ 20-day vol < 40%, QQQ within 7% of its 20-day high, and QQQ has not dropped > 4% in 3 days. Otherwise 100% cash.
+- **Stock book:** top 3 names by a 63/21/126-day momentum blend, divided by sqrt(volatility); must be above the 20/50-day SMAs and within 10% of the 20-day high; liquidity >= $100M/day.
+- **Leverage sleeve:** 25% in SOXL (or TQQQ) only in a calm, hot QQQ uptrend; gross is scaled to <= 1.38x beta-adjusted.
+- **Caps:** per-name target <= 26% with a hard trim at 28.5%; leveraged positions are trimmed if gross > 1.43x; 10% stop vs average cost.
 
-Why this and not stock/sector momentum: on a 10-year walk-forward test (`backtest.py`, 112 rolling 60-day windows, 2017–2026), momentum rotation over a ticker list with no hindsight (the largest US stocks at end-2016, or sector ETFs) made ~4–8% a year, trailing QQQ buy-and-hold (~20%). Trendline made ~20.6% CAGR with a 30% max drawdown, versus QQQ's 35%. Past results on one decade of data are not a forecast.
-
-- `python strategy_selftest.py` — strategy-specific cap/regime checks.
-- `python fetch_history.py && python backtest.py` — the 10-year walk-forward test (downloads public daily bars; not needed for submission).
+Research harness (rolling-window backtests using the engine's exact fill model) lives in `research/`.
 
 ---
 

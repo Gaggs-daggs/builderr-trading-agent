@@ -1,9 +1,4 @@
-"""Apex Momentum — aggressive, stateless, stdlib-only (no network, no LLM, no keys).
-
-Regime gate (QQQ above 50d AND 200d, SPY above 50d, QQQ vol < 25%, crash guard; leverage only if QQQ vol < 24%) -> top-3 momentum leaders (63/21/126d blend, vol-aware weights)
-+ a 25% 3x sleeve (SOXL, else TQQQ) only when QQQ is in a calm, hot uptrend. Caps: names <=26% (trim at 28.5%),
-beta-gross <=1.38x (trim at 1.43x), 10% stop vs avg cost, flat when the regime is off.
-"""
+"""Apex Momentum v2 — aggressive, stateless, stdlib-only."""
 from __future__ import annotations
 from math import sqrt
 
@@ -11,31 +6,18 @@ P = dict(
     K=3,              # names held
     W_MAX=0.26,       # per-name cap (engine cap is 0.30)
     LEV_SHARE=0.25,   # share of equity in 3x ETFs when regime is hot
-    GROSS_MAX=1.38,
-    MIN_DOLLAR_VOL=100e6,
-    VOL_MAX=1.0,
+    GROSS_MAX=1.44,
+    MIN_DOLLAR_VOL=40e6,
     W63=0.45, W21=0.35, W126=0.20,
     VOL_PEN=0.5,      # score / vol**VOL_PEN
     NEAR_HIGH=0.10,   # must be within 10% of 20d high
     BAND=0.03,        # rebalance band (fraction of equity)
     HOLD_RANK=8,      # keep incumbents if still within top-N
-    QQQ_VOL_OFF=0.25,
+    QQQ_VOL_OFF=0.40,
     STOP=0.10,
     TRIM_AT=0.285,    # hard trim: never sit near the 30% concentration line
-    GROSS_TRIM=1.43,
+    GROSS_TRIM=1.47,
     CRASH_3D=-0.04,
-    EXT_MAX=9.0,      # skip if close/SMA20-1 above this (overextended)
-    R5_MAX=9.0,       # skip if 5d return above this
-    RS_W=0.0,         # weight of 63d relative strength vs QQQ
-    HI_W=0.0,         # weight of proximity to 250d high
-    WEIGHTING='invvol',
-    LEV_CHOICE='auto',
-    MIN_R21=0.0,
-    REG200=True,
-    HOT_VOL=0.24,
-    HOT_R21=-1.0,    # momentum gate on leverage: disabled (tested 0.02: fewer big losses, less upside)
-    HOT_R63=-1.0,
-    BREADTH=0.0,
 )
 BETA = {"TQQQ": 3., "SOXL": 3., "UPRO": 3., "SPXL": 3., "TNA": 3., "FAS": 3., "TECL": 3., "LABU": 3.,
         "CURE": 3., "DRN": 3., "UDOW": 3., "NAIL": 3., "QLD": 2., "SSO": 2., "DDM": 2., "ROM": 2., "UWM": 2., "AGQ": 2.}
@@ -75,25 +57,11 @@ def regime(ms):
     hi20 = max(q[-20:])
     crash = q[-1] / q[-4] - 1 < P["CRASH_3D"]
     on = (not crash) and q[-1] > q50 and s[-1] > s50 and qv < P["QQQ_VOL_OFF"] and q[-1] > hi20 * 0.93
-    if P["REG200"] and (len(q) < 200 or q[-1] < _sma(q, 200)):
-        on = False
-    if on and P["BREADTH"] > 0:
-        up = tot = 0
-        for t, b in ms.items():
-            if t in EXCLUDE:
-                continue
-            x = _c(b)
-            if len(x) >= 50:
-                tot += 1
-                up += x[-1] > _sma(x, 50)
-        if tot >= 8 and up / tot < P["BREADTH"]:
-            on = False
-    hot = on and q[-1] > q20 and q20 > q50 and qv < P["HOT_VOL"] and q[-1] > hi20 * 0.97 and (_ret(q, 21) or 0) > P["HOT_R21"] and (_ret(q, 63) or 0) > P["HOT_R63"]
+    hot = on and q[-1] > q20 and q20 > q50 and qv < 0.30 and q[-1] > hi20 * 0.97
     return (1.0 if on else 0.0), hot
 
 
 def rank(ms):
-    ms = ms
     out = []
     for t, bars in ms.items():
         if t in EXCLUDE:
@@ -109,16 +77,11 @@ def rank(ms):
             continue
         r21, r63, r126 = _ret(x, 21), _ret(x, 63), _ret(x, 126)
         s20, s50, v = _sma(x, 20), _sma(x, 50), _vol(x, 20)
-        if None in (r21, r63, r126, s20, s50, v) or v <= 0 or v > P["VOL_MAX"]:
-            continue
-        if x[-1] / s20 - 1 > P["EXT_MAX"] or (_ret(x, 5) or 0) > P["R5_MAX"] or r21 < P["MIN_R21"]:
+        if None in (r21, r63, r126, s20, s50, v) or v <= 0:
             continue
         if not (x[-1] > s20 and x[-1] > s50 and r21 > 0 and x[-1] >= max(x[-20:]) * (1 - P["NEAR_HIGH"])):
             continue
         mom = P["W63"] * r63 + P["W21"] * r21 + P["W126"] * r126
-        if P["RS_W"] or P["HI_W"]:
-            qx = _c(ms.get("QQQ", []))
-            mom += P["RS_W"] * (r63 - (_ret(qx, 63) or 0)) + P["HI_W"] * (x[-1] / max(x[-250:]) - 1)
         if mom <= 0:
             continue
         out.append((mom / (v ** P["VOL_PEN"]), t, v))
@@ -149,20 +112,11 @@ def targets(ms, held):
         sx, tq = _c(ms.get("SOXL", [])), _c(ms.get("TQQQ", []))
         use_soxl = len(sx) > 50 and len(sm) > 50 and sm[-1] > _sma(sm, 20) and (_ret(sm, 21) or 0) > (_ret(qq, 21) or 0) and sx[-1] > _sma(sx, 20)
         use_tqqq = len(tq) > 50 and tq[-1] > _sma(tq, 20)
-        if P["LEV_CHOICE"] == "TQQQ":
-            use_soxl = False
-        elif P["LEV_CHOICE"] == "SOXL":
-            use_tqqq = False
         levt = {"SOXL": lev} if use_soxl else ({"TQQQ": lev} if use_tqqq else {})
         if not levt:
             lev = 0.0
     budget = 1.0 - lev - 0.02
-    if P["WEIGHTING"] == "equal":
-        inv = {t: 1.0 for _, t, v in ranked if t in pick}
-    elif P["WEIGHTING"] == "score":
-        inv = {t: max(sc, 0.01) for sc, t, v in ranked if t in pick}
-    else:
-        inv = {t: 1.0 / max(v, 0.15) for _, t, v in ranked if t in pick}
+    inv = {t: 1.0 / max(v, 0.15) for _, t, v in ranked if t in pick}
     tot = sum(inv.values())
     w = {t: min(P["W_MAX"], budget * inv[t] / tot) for t in pick}
     w.update(levt)

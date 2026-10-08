@@ -13,3 +13,10 @@ data_cache/
 # private entrants' code — scored locally, never published
 private_agents/
 private_endpoint_decisions/
+
+# research artifacts
+research/bars.pkl
+research/__pycache__/
+research/prev/
+research/bars_nse.pkl
+research/agent_v3_backup.py

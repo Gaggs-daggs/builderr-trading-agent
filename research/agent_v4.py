@@ -1,6 +1,6 @@
 """Apex Momentum — aggressive, stateless, stdlib-only (no network, no LLM, no keys).
 
-Regime gate (QQQ above 50d AND 200d, SPY above 50d, QQQ vol < 25%, crash guard; leverage only if QQQ vol < 24%) -> top-3 momentum leaders (63/21/126d blend, vol-aware weights)
+Regime gate (QQQ/SPY trend + vol + crash guard) -> top-3 momentum leaders (63/21/126d blend, vol-aware weights)
 + a 25% 3x sleeve (SOXL, else TQQQ) only when QQQ is in a calm, hot uptrend. Caps: names <=26% (trim at 28.5%),
 beta-gross <=1.38x (trim at 1.43x), 10% stop vs avg cost, flat when the regime is off.
 """
@@ -19,7 +19,7 @@ P = dict(
     NEAR_HIGH=0.10,   # must be within 10% of 20d high
     BAND=0.03,        # rebalance band (fraction of equity)
     HOLD_RANK=8,      # keep incumbents if still within top-N
-    QQQ_VOL_OFF=0.25,
+    QQQ_VOL_OFF=0.40,
     STOP=0.10,
     TRIM_AT=0.285,    # hard trim: never sit near the 30% concentration line
     GROSS_TRIM=1.43,
@@ -31,9 +31,9 @@ P = dict(
     WEIGHTING='invvol',
     LEV_CHOICE='auto',
     MIN_R21=0.0,
-    REG200=True,
-    HOT_VOL=0.24,
-    HOT_R21=-1.0,    # momentum gate on leverage: disabled (tested 0.02: fewer big losses, less upside)
+    REG200=False,
+    HOT_VOL=0.30,
+    HOT_R21=-1.0,
     HOT_R63=-1.0,
     BREADTH=0.0,
 )
